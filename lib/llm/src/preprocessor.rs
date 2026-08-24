@@ -75,11 +75,17 @@ use crate::protocols::{
     TokenIdType,
     common::{
         OutputOptionsProvider, SamplingOptionsProvider, StopConditionsProvider,
-        extensions::{AgentHints, NvExtProvider, request_cache_salt, routing_constraints_to_kv},
+        extensions::{
+            AgentHints, NvExtProvider, merge_response_nvext, request_cache_salt,
+            routing_constraints_to_kv,
+        },
     },
     openai::{
         DeltaGeneratorExt,
-        chat_completions::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse},
+        chat_completions::{
+            NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+            scrub_synthetic_chunk_metadata,
+        },
         completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
         embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
     },
@@ -114,6 +120,29 @@ fn invalid_argument_error(message: impl Into<String>) -> anyhow::Error {
         .message(message.into())
         .build()
         .into()
+}
+
+fn validate_legacy_jail_nvext_choice_count(
+    n: u8,
+    extra_fields: Option<&[String]>,
+    is_legacy_jail: bool,
+) -> Result<()> {
+    if n <= 1 || !is_legacy_jail {
+        return Ok(());
+    }
+
+    const CHOICE_SPECIFIC_FIELDS: [&str; 3] = ["engine_data", "routed_experts", "stop_reason"];
+    if let Some(field) = extra_fields.and_then(|fields| {
+        fields
+            .iter()
+            .find(|field| CHOICE_SPECIFIC_FIELDS.contains(&field.as_str()))
+    }) {
+        return Err(invalid_argument_error(format!(
+            "legacy tool-call parsing requires n = 1 when nvext.extra_fields requests choice-specific field `{field}`"
+        )));
+    }
+
+    Ok(())
 }
 
 fn tool_content_part_as_user(
@@ -358,40 +387,6 @@ struct ChoiceReasoningState {
     // parser had already handed over. Draining again is fine; finalizing again
     // is not.
     parser_finished: bool,
-}
-
-/// Strip every per-chunk field from a response that is being reused as the
-/// envelope for a synthetic end-of-stream chunk.
-///
-/// Both end-of-stream flushes build their chunk by cloning the last chunk they
-/// saw, because that is the only way to carry the buffered bytes out on a
-/// correctly-shaped response. The clone is not a new generation: it produced no
-/// tokens and re-channels bytes the parser was already holding. So everything
-/// describing the *original* chunk's generation has to go, or it is reported
-/// twice:
-///
-/// - `event` / `comment` — the annotation channel carries per-chunk payloads
-///   such as generated `token_ids`.
-/// - `error` — an error annotation must not be replayed on a later chunk.
-/// - `usage` / `llm_metrics` — `metrics.rs` sums `chunk_tokens` and samples an
-///   ITL point per chunk carrying `llm_metrics`.
-/// - `nvext` — per-chunk NVIDIA extensions. `merge_response_nvext` append-merges
-///   `completion_token_ids`, so a repeat turns `[42]` into `[42, 42]`, and
-///   fields it does not append (such as `prompt_logprobs`) are overwritten.
-///
-/// Kept as one function so the two call sites cannot drift apart: they already
-/// did, which is how `nvext` survived on both.
-fn scrub_synthetic_chunk_metadata(
-    response: &mut Annotated<NvCreateChatCompletionStreamResponse>,
-) -> Option<()> {
-    response.event = None;
-    response.comment = None;
-    response.error = None;
-    let data = response.data.as_mut()?;
-    data.inner.usage = None;
-    data.llm_metrics = None;
-    data.nvext = None;
-    Some(())
 }
 
 /// Estimates reasoning-token usage from the parser-classified Chat Completion stream.
@@ -3697,6 +3692,15 @@ impl OpenAIPreprocessor {
                 None | Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Auto)
             );
 
+        validate_legacy_jail_nvext_choice_count(
+            request.inner.n.unwrap_or(1),
+            request
+                .nvext
+                .as_ref()
+                .and_then(|nvext| nvext.extra_fields.as_deref()),
+            should_jail && !use_parsers_v2,
+        )?;
+
         // Apply jail conditionally
         let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
             if should_jail && use_parsers_v2 {
@@ -4219,9 +4223,9 @@ impl OpenAIPreprocessor {
     /// `Annotated<CreateChatCompletionStreamResponse>`, runs the moved jail, and
     /// re-wraps the result.
     ///
-    /// `nvext` is not populated on the streaming tool-call path (only the unary
-    /// aggregator/anthropic paths set it), so the jail never needs to preserve
-    /// it and re-wrapped chunks carry `nvext: None`.
+    /// The parser can buffer and rewrite several input chunks before it emits an
+    /// output. Completion token IDs therefore describe the ordered buffered
+    /// group, not the rewritten text in one output delta.
     pub fn apply_tool_calling_jail<S>(
         tool_call_parser: Option<String>,
         tool_choice: Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
@@ -4235,7 +4239,8 @@ impl OpenAIPreprocessor {
         use dynamo_parsers::tool_calling::jail::{
             Annotated as JailAnnotated, apply_tool_calling_jail as jail_apply,
         };
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
 
         // The jail operates on the shared `Create` payload and never touches the
         // dynamo-only typed `llm_metrics`, which `transform_postprocessor_stream`
@@ -4251,12 +4256,19 @@ impl OpenAIPreprocessor {
         // and `observe_current_osl` takes the latest `output_tokens`. (The
         // annotation form on data-less usage chunks rides through untouched via
         // `event`/`comment`.)
+        //
+        // `nvext` uses the unary aggregator's merge rules: completion token IDs
+        // are appended, while the latest supplied value wins for every other
+        // top-level field. `engine_data` is replaced as one complete value.
         #[derive(Default)]
-        struct PendingMetrics {
-            template: Option<LLMMetricAnnotation>,
+        struct PendingDynamoMetadata {
+            metrics_template: Option<LLMMetricAnnotation>,
             chunk_tokens: usize,
+            nvext: Option<serde_json::Value>,
+            response_template: Option<dynamo_protocols::types::CreateChatCompletionStreamResponse>,
+            transport_failed: bool,
         }
-        let pending = Arc::new(Mutex::new(PendingMetrics::default()));
+        let pending = Arc::new(Mutex::new(PendingDynamoMetadata::default()));
         let pending_in = Arc::clone(&pending);
 
         // Per-choice recovery state — allocated only for glm47 since only that
@@ -4286,18 +4298,50 @@ impl OpenAIPreprocessor {
         let choice_recovery_in = Arc::clone(&choice_recovery);
         let glm47_start_jail = glm47_start.clone();
 
-        // dynamo `Annotated<Nv>` -> jail `Annotated<Create>` (buffer llm_metrics)
+        // dynamo `Annotated<Nv>` -> jail `Annotated<Create>` (buffer Dynamo metadata)
         let jail_input = stream.map(move |mut a| {
-            if let Some(metrics) = a.data.as_mut().and_then(|nv| nv.llm_metrics.take()) {
-                let mut p = pending_in.lock().expect("jail metrics buffer poisoned");
-                p.chunk_tokens = p.chunk_tokens.saturating_add(metrics.chunk_tokens);
-                p.template = Some(metrics);
+            let has_error = a.error.is_some();
+            let has_metadata = a
+                .data
+                .as_ref()
+                .is_some_and(|nv| nv.llm_metrics.is_some() || nv.nvext.is_some());
+            if has_error || has_metadata {
+                let mut p = pending_in.lock();
+                if has_error {
+                    p.transport_failed = true;
+                    p.metrics_template = None;
+                    p.chunk_tokens = 0;
+                    p.nvext = None;
+                    p.response_template = None;
+                } else if !p.transport_failed
+                    && let Some(nv) = a.data.as_mut()
+                {
+                    if p.response_template.is_none() {
+                        p.response_template = Some(
+                            dynamo_protocols::types::CreateChatCompletionStreamResponse {
+                                id: nv.inner.id.clone(),
+                                object: nv.inner.object.clone(),
+                                created: nv.inner.created,
+                                model: nv.inner.model.clone(),
+                                choices: Vec::new(),
+                                usage: None,
+                                service_tier: nv.inner.service_tier.clone(),
+                                system_fingerprint: nv.inner.system_fingerprint.clone(),
+                            },
+                        );
+                    }
+                    if let Some(metrics) = nv.llm_metrics.take() {
+                        p.chunk_tokens = p.chunk_tokens.saturating_add(metrics.chunk_tokens);
+                        p.metrics_template = Some(metrics);
+                    }
+                    merge_response_nvext(&mut p.nvext, nv.nvext.take());
+                }
             }
             // Buffer input content only for glm47 (truncation recovery).
             // Only retain from the last <tool_call> marker onward to bound
             // memory on long responses.
             if is_glm47 && let Some(data) = &a.data {
-                let mut cr = choice_recovery_in.lock().expect("choice recovery poisoned");
+                let mut cr = choice_recovery_in.lock();
                 for choice in &data.inner.choices {
                     if let Some(ChatCompletionMessageContent::Text(content)) = &choice.delta.content
                     {
@@ -4333,8 +4377,10 @@ impl OpenAIPreprocessor {
             }
         });
 
-        // jail `Annotated<Create>` -> dynamo `Annotated<Nv>` (re-attach llm_metrics)
-        jail_apply(
+        // jail `Annotated<Create>` -> dynamo `Annotated<Nv>` (re-attach Dynamo metadata)
+        let pending_out = Arc::clone(&pending);
+        let pending_eof = Arc::clone(&pending);
+        let jailed_output = jail_apply(
             tool_call_parser,
             tool_choice,
             tool_definitions,
@@ -4342,21 +4388,33 @@ impl OpenAIPreprocessor {
             jail_input,
         )
         .flat_map(move |a| {
-            // Stamp the accumulated metrics onto the next emitted data chunk;
-            // data-less/synthesized chunks carry it forward (or `None`).
-            let llm_metrics = a.data.as_ref().and_then(|_| {
-                let mut p = pending.lock().expect("jail metrics buffer poisoned");
+            // Metrics can ride on payload-only usage chunks because the HTTP
+            // layer observes them before removing the chunk. Client-visible
+            // nvext must wait for a non-payload-usage output with a choice.
+            let has_choices = a.data.as_ref().is_some_and(|data| !data.choices.is_empty());
+            let is_payload_usage = a.event.as_deref() == Some(ANNOTATION_PAYLOAD_USAGE);
+            let (llm_metrics, nvext) = a.data.as_ref().map_or((None, None), |_| {
+                let mut p = pending_out.lock();
+                if p.transport_failed {
+                    return (None, None);
+                }
                 let chunk_tokens = p.chunk_tokens;
                 p.chunk_tokens = 0;
-                p.template.take().map(|mut metrics| {
+                let metrics = p.metrics_template.take().map(|mut metrics| {
                     metrics.chunk_tokens = chunk_tokens;
                     metrics
-                })
+                });
+                let nvext = if has_choices && !is_payload_usage {
+                    p.nvext.take()
+                } else {
+                    None
+                };
+                (metrics, nvext)
             });
             let mut nv_chunk = Annotated {
                 data: a.data.map(|inner| NvCreateChatCompletionStreamResponse {
                     inner,
-                    nvext: None,
+                    nvext,
                     llm_metrics,
                 }),
                 id: a.id,
@@ -4382,7 +4440,7 @@ impl OpenAIPreprocessor {
             // We collect into a Vec so we can release the immutable borrow on
             // nv_chunk before mutating it in pass 2.
             let recoveries: Vec<PendingRecovery> = if is_glm47 {
-                let mut cr = choice_recovery.lock().expect("choice recovery poisoned");
+                let mut cr = choice_recovery.lock();
                 nv_chunk
                     .data
                     .iter()
@@ -4484,12 +4542,8 @@ impl OpenAIPreprocessor {
                     );
                     let mut rec = nv_chunk.clone();
                     rec.id = None;
-                    rec.event = None;
-                    rec.comment = None;
-                    rec.error = None;
+                    scrub_synthetic_chunk_metadata(&mut rec);
                     let rd = rec.data.as_mut()?;
-                    rd.inner.usage = None;
-                    rd.llm_metrics = None;
                     rd.inner.choices.retain(|c| c.index == choice_idx);
                     for rc in &mut rd.inner.choices {
                         rc.delta.content = Some(ChatCompletionMessageContent::Text(tail.clone()));
@@ -4502,7 +4556,53 @@ impl OpenAIPreprocessor {
                 .collect();
 
             futures::stream::iter(recovery_chunks.into_iter().chain(std::iter::once(nv_chunk)))
-        })
+        });
+
+        let with_eof_metadata = async_stream::stream! {
+            tokio::pin!(jailed_output);
+            while let Some(response) = jailed_output.next().await {
+                yield response;
+            }
+
+            let eof_metadata = {
+                let mut p = pending_eof.lock();
+                if p.transport_failed {
+                    p.metrics_template = None;
+                    p.chunk_tokens = 0;
+                    p.nvext = None;
+                    p.response_template = None;
+                    None
+                } else {
+                    let chunk_tokens = p.chunk_tokens;
+                    p.chunk_tokens = 0;
+                    let llm_metrics = p.metrics_template.take().map(|mut metrics| {
+                        metrics.chunk_tokens = chunk_tokens;
+                        metrics
+                    });
+                    let nvext = p.nvext.take();
+                    if llm_metrics.is_none() && nvext.is_none() {
+                        None
+                    } else {
+                        p.response_template.take().map(|inner| Annotated {
+                            data: Some(NvCreateChatCompletionStreamResponse {
+                                inner,
+                                nvext,
+                                llm_metrics,
+                            }),
+                            id: None,
+                            event: None,
+                            comment: None,
+                            error: None,
+                        })
+                    }
+                }
+            };
+            if let Some(response) = eof_metadata {
+                yield response;
+            }
+        };
+
+        Self::hold_usage_until_stream_end(with_eof_metadata)
     }
 
     /// Whether the selected tool-call or reasoning parser depends on the
@@ -5142,7 +5242,7 @@ impl OpenAIPreprocessor {
                 // See `scrub_synthetic_chunk_metadata`: this chunk produced no
                 // tokens, so every per-chunk field from the envelope it was
                 // cloned from has to be dropped rather than reported twice.
-                scrub_synthetic_chunk_metadata(&mut response)?;
+                scrub_synthetic_chunk_metadata(&mut response);
                 let data = response.data.as_mut()?;
                 // Rebuild the choice list from the flushed indices rather than
                 // reusing the envelope's own choices: with `n > 1` the last
@@ -5176,7 +5276,8 @@ impl OpenAIPreprocessor {
     /// been emitted. A truncated upstream stream can end without
     /// `finish_reason`, so reasoning recovery happens at EOF; forwarding usage
     /// immediately would put that recovered content after the chunk clients
-    /// treat as the stream trailer.
+    /// treat as the stream trailer. A transport error discards the pending
+    /// trailer because the response did not complete successfully.
     fn hold_usage_until_stream_end<S>(
         stream: S,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
@@ -5186,7 +5287,14 @@ impl OpenAIPreprocessor {
         async_stream::stream! {
             tokio::pin!(stream);
             let mut pending_usage = None;
+            let mut transport_failed = false;
             while let Some(response) = stream.next().await {
+                if response.error.is_some() {
+                    transport_failed = true;
+                    pending_usage = None;
+                    yield response;
+                    continue;
+                }
                 let is_usage_only = response.data.as_ref().is_some_and(|data| {
                     data.inner.choices.is_empty() && data.inner.usage.is_some()
                 });
@@ -5198,7 +5306,7 @@ impl OpenAIPreprocessor {
                     yield response;
                 }
             }
-            if let Some(usage) = pending_usage {
+            if !transport_failed && let Some(usage) = pending_usage {
                 yield usage;
             }
         }
@@ -5330,7 +5438,7 @@ impl OpenAIPreprocessor {
                     // is a clone of an already-counted chunk, so it goes through
                     // the shared scrub rather than repeating a partial copy of
                     // it here.
-                    scrub_synthetic_chunk_metadata(&mut response)?;
+                    scrub_synthetic_chunk_metadata(&mut response);
                     let data = response.data.as_mut()?;
                     let mut template = data.inner.choices.first()?.clone();
                     template.delta.role = None;
@@ -5841,6 +5949,29 @@ mod tests {
         ChatChoiceStream, ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse,
         FinishReason, Role,
     };
+
+    #[test]
+    fn legacy_jail_rejects_multiple_choices_for_choice_specific_nvext() {
+        let engine_data = vec!["engine_data".to_string()];
+        let request_level = vec!["timing".to_string(), "worker_id".to_string()];
+
+        assert!(
+            validate_legacy_jail_nvext_choice_count(2, Some(&engine_data), true).is_err(),
+            "legacy jail must reject choice-specific nvext with n > 1"
+        );
+        assert!(
+            validate_legacy_jail_nvext_choice_count(1, Some(&engine_data), true).is_ok(),
+            "n = 1 remains supported"
+        );
+        assert!(
+            validate_legacy_jail_nvext_choice_count(2, Some(&request_level), true).is_ok(),
+            "request-level metadata remains supported"
+        );
+        assert!(
+            validate_legacy_jail_nvext_choice_count(2, Some(&engine_data), false).is_ok(),
+            "parser v2 is not subject to the legacy jail restriction"
+        );
+    }
 
     fn chat_stream_chunk(
         index: u32,
