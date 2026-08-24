@@ -282,8 +282,7 @@ template and adapt it:
 
 Good recipe starting points:
 
-- [Kimi-K3 vLLM disagg + KV router](https://github.com/ai-dynamo/dynamo/tree/main/recipes/kimi-k3)
-- [GPT-OSS-120B vLLM agentic recipes](https://github.com/ai-dynamo/dynamo/tree/main/recipes/gpt-oss-120b)
+- [Qwen3-32B vLLM disagg + KV router](https://github.com/ai-dynamo/dynamo/tree/main/recipes/qwen3-32b)
 
 Backend deployment examples with concrete worker flags:
 

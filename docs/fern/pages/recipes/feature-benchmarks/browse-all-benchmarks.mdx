@@ -183,4 +183,45 @@ Feature Benchmarks evaluate Dynamo features, topologies, and feature stacks unde
 <span className="dynamo-benchmark-open">Open</span>
 <a className="dynamo-card-link" href="qwen3-6-35b-feature-stack.mdx" aria-label="Open the Frontend decoding plus embedding cache benchmark">Open</a>
 </div>
+<div className="dynamo-benchmark-row">
+<div className="dynamo-benchmark-main">
+<span className="dynamo-benchmark-kind">A/B test</span>
+<h2>Multimodal embedding cache</h2>
+<p>How much does enabling the vLLM multimodal embedding cache improve repeated-image traffic on one GB200 worker?</p>
+</div>
+<div className="dynamo-benchmark-features">
+<span className="dynamo-feature-pair"><span className="dynamo-feature-symbol feature-ec" aria-hidden="true"><svg className="dynamo-feature-icon"><use href="#dynamo-icon-ec" /></svg></span><span>Embedding cache</span></span>
+</div>
+<div className="dynamo-benchmark-model">
+<img className="dynamo-model-logo" src="../../../assets/img/recipes/providers/qwen.webp" alt="" />
+<div><strong>Qwen3-VL-30B</strong></div>
+</div>
+<div className="dynamo-benchmark-target">
+<span><b>Traffic</b><strong>80% image reuse</strong></span>
+<span><b>Hardware</b><strong>1x GB200</strong></span>
+</div>
+<span className="dynamo-benchmark-open">Open</span>
+<a className="dynamo-card-link" href="qwen3-vl-embedding-cache.mdx" aria-label="Open the Multimodal embedding cache benchmark">Open</a>
+</div>
+<div className="dynamo-benchmark-row">
+<div className="dynamo-benchmark-main">
+<span className="dynamo-benchmark-kind">A/B test</span>
+<h2>KV-aware routing + prefill/decode split</h2>
+<p>Does disaggregated KV-aware routing reduce TTFT and ITL compared with aggregated round-robin routing?</p>
+</div>
+<div className="dynamo-benchmark-features">
+<span className="dynamo-feature-pair"><span className="dynamo-feature-symbol feature-kv" aria-hidden="true"><svg className="dynamo-feature-icon"><use href="#dynamo-icon-kv" /></svg></span><span>KV routing</span></span>
+<span className="dynamo-feature-pair"><span className="dynamo-feature-symbol feature-pd" aria-hidden="true"><svg className="dynamo-feature-icon"><use href="#dynamo-icon-pd" /></svg></span><span>P/D split</span></span>
+</div>
+<div className="dynamo-benchmark-model">
+<img className="dynamo-model-logo" src="../../../assets/img/recipes/providers/qwen.webp" alt="" />
+<div><strong>Qwen3-32B</strong></div>
+</div>
+<div className="dynamo-benchmark-target">
+<span><b>Traffic</b><strong>Mooncake prefix reuse</strong></span>
+<span><b>Hardware</b><strong>16x H200</strong></span>
+</div>
+<span className="dynamo-benchmark-open">Open</span>
+<a className="dynamo-card-link" href="qwen3-32b-kv-routing-a-b.mdx" aria-label="Open the KV-aware routing + prefill/decode split benchmark">Open</a>
+</div>
 </div>

@@ -164,7 +164,7 @@ spec:
 
 | 模型 | 框架 | 模式 | 配方 |
 |------|------|------|------|
-| GPT-OSS-120B | TensorRT-LLM | 聚合式 | [查看](recipes/gpt-oss-120b/trtllm/) |
+| Qwen3-32B-FP8 | TensorRT-LLM | 聚合式 | [查看](recipes/qwen3-32b-fp8/trtllm/) |
 | DeepSeek-R1 | SGLang | 分离式 | [查看](recipes/deepseek-r1/sglang/) |
 | Kimi-K3 | vLLM | 聚合式 | [查看](recipes/kimi-k3/vllm/) |
 

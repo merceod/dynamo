@@ -7,5 +7,7 @@
 # the Feature Benchmarks section in docs/index.yml.
 schema_version: 1
 benchmarks:
+- qwen3-32b-kv-routing
 - kimi-k2-5-feature-stack
 - qwen3-6-35b-feature-stack
+- qwen3-vl-embedding-cache

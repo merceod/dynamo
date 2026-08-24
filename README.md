@@ -191,7 +191,7 @@ Pre-built recipes for common models:
 
 | Model | Framework | Mode | Recipe |
 |-------|-----------|------|--------|
-| GPT-OSS-120B | TensorRT-LLM | Aggregated | [View](recipes/gpt-oss-120b/trtllm/) |
+| Qwen3-32B-FP8 | TensorRT-LLM | Aggregated | [View](recipes/qwen3-32b-fp8/trtllm/) |
 | DeepSeek-R1 | SGLang | Disaggregated | [View](recipes/deepseek-r1/sglang/) |
 | Kimi-K3 | vLLM | Aggregated | [View](recipes/kimi-k3/vllm/) |
 
