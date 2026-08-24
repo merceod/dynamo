@@ -108,10 +108,7 @@ pub(crate) fn build_generate_request(
     } else {
         output_options.prompt_logprobs.map(|_| 0).unwrap_or(-1)
     };
-    let routed_dp_rank = request
-        .routing
-        .as_ref()
-        .and_then(|routing| routing.dp_rank)
+    let routed_dp_rank = routed_dp_rank(request, mode)
         .map(i32::try_from)
         .transpose()
         .map_err(|_| client::invalid_arg("routed dp_rank does not fit in i32"))?;
@@ -142,6 +139,19 @@ pub(crate) fn build_generate_request(
             bootstrap_host,
             bootstrap_port,
         )?,
+    })
+}
+
+pub(crate) fn routed_dp_rank(
+    request: &PreprocessedRequest,
+    mode: DisaggregationMode,
+) -> Option<u32> {
+    request.routing.as_ref().and_then(|routing| {
+        if mode.is_prefill() {
+            routing.prefill_dp_rank.or(routing.dp_rank)
+        } else {
+            routing.dp_rank
+        }
     })
 }
 
@@ -577,6 +587,7 @@ pub(crate) fn extract_logprobs(
 mod tests {
     use std::collections::HashMap;
 
+    use dynamo_backend_common::engine::RoutingHints;
     use dynamo_backend_common::{
         BootstrapInfo, DisaggregationMode, FinishReason, OutputOptions, PrefillResult,
         PreprocessedRequest, SamplingOptions, StopConditions,
@@ -585,7 +596,7 @@ mod tests {
 
     use super::{
         build_generate_request, disaggregated_params_to_json, engine_data_from_meta,
-        extract_logprobs, new_output_ids, terminal_from_meta,
+        extract_logprobs, new_output_ids, routed_dp_rank, terminal_from_meta,
     };
 
     fn request() -> PreprocessedRequest {
@@ -647,6 +658,31 @@ mod tests {
         assert_eq!(mapped.top_logprobs_num, Some(0));
         assert_eq!(mapped.logprob_start_len, Some(-1));
         assert_eq!(mapped.disaggregated_params.unwrap().bootstrap_port, 5001);
+    }
+
+    #[test]
+    fn prefill_uses_selected_prefill_dp_rank() {
+        let mut request = request();
+        request.routing = Some(RoutingHints {
+            dp_rank: Some(7),
+            prefill_dp_rank: Some(3),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            routed_dp_rank(&request, DisaggregationMode::Prefill),
+            Some(3)
+        );
+        assert_eq!(
+            routed_dp_rank(&request, DisaggregationMode::Aggregated),
+            Some(7)
+        );
+
+        request.routing.as_mut().unwrap().prefill_dp_rank = None;
+        assert_eq!(
+            routed_dp_rank(&request, DisaggregationMode::Prefill),
+            Some(7)
+        );
     }
 
     #[test]

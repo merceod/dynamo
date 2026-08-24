@@ -28,6 +28,9 @@ Use `SGLANG_GRPC_ENDPOINT` instead of `--sglang-endpoint` when the endpoint is p
 
 Native Dynamo `/generate` requests are forwarded opaquely to SGLang's HTTP
 endpoint using the gRPC host and the HTTP port returned by `GetServerInfo`.
+The sidecar advertises this capability only after the HTTP health probe passes
+and discovery confirms `--incremental-streaming-output`; otherwise it continues
+serving the native gRPC path without advertising `/generate`.
 
 The sidecar discovers the model and tokenizer paths, served model name, parser defaults, worker role, context length, KV capacity, scheduler limits, data-parallel topology, and KV-event sources through SGLang's native discovery RPCs. Explicit Dynamo parser options override parser names discovered from SGLang.
 
@@ -45,6 +48,7 @@ SGLang can load the Python entry point and supply the gRPC endpoint arguments:
 python3 -m sglang.launch_server \
     <args> \
     --grpc-port 30001 \
+    --incremental-streaming-output \
     --sidecar dynamo.sglang.sidecar
 ```
 
