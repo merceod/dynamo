@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::config::RouterQueuePolicy;
-use super::flow_control::{FlowControlConfig, FlowControlRuntime};
+use super::flow_control::{FlowControlConfig, FlowControlEvent, FlowControlRuntime};
 use super::overlap::OverlapSignals;
 use super::overlap_refresh::{NoopOverlapScoresRefresh, OverlapScoresRefresh};
 use super::policy_config::PolicyProfile;
@@ -37,6 +37,58 @@ enum WorkerConfigReconcileOutcome {
     Unchanged,
     Applied,
     Rejected,
+}
+
+struct FlowControlRequestGuard {
+    flow_control: Arc<FlowControlRuntime>,
+    request_id: Option<String>,
+    tracked: bool,
+    released: bool,
+}
+
+impl FlowControlRequestGuard {
+    fn new(
+        flow_control: Arc<FlowControlRuntime>,
+        request_id: Option<String>,
+        tracked: bool,
+    ) -> Self {
+        Self {
+            flow_control,
+            request_id,
+            tracked,
+            released: false,
+        }
+    }
+
+    fn selected(&mut self, worker: WorkerWithDpRank) {
+        let Some(request_id) = self.request_id.take() else {
+            self.released = true;
+            return;
+        };
+        let event = if self.tracked {
+            FlowControlEvent::Dispatched { request_id, worker }
+        } else {
+            FlowControlEvent::Completed {
+                request_id,
+                context_tokens: None,
+            }
+        };
+        self.flow_control.emit(event);
+        self.released = true;
+    }
+}
+
+impl Drop for FlowControlRequestGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let Some(request_id) = self.request_id.take() else {
+            return;
+        };
+        self.flow_control
+            .emit(FlowControlEvent::Aborted { request_id });
+    }
 }
 
 pub struct LocalScheduler<P, C, Sel = DefaultWorkerSelector, RF = NoopOverlapScoresRefresh>
@@ -299,6 +351,7 @@ where
             let queue_updates_config = queue_updates.clone();
             let mut monitor_rx = workers_with_configs.clone();
             let monitor_cancel_token = cancellation_token.clone();
+            let flow_control_config_updates = flow_control.clone();
             tokio::spawn(async move {
                 tracing::trace!("LocalScheduler workers monitoring task started");
                 let mut last_workers = None;
@@ -331,6 +384,9 @@ where
                     {
                         queue_config_updates.update().await;
                         let _ = queue_updates_config.send(());
+                        if let Some(flow_control) = flow_control_config_updates.as_ref() {
+                            flow_control.emit(FlowControlEvent::Reconcile);
+                        }
                     }
                 }
             });
@@ -341,6 +397,7 @@ where
         let mut remote_state_updates = slots.subscribe_remote_state_changes();
         let remote_update_cancel_token = cancellation_token.clone();
         let queue_updates_remote = queue_updates.clone();
+        let flow_control_remote_updates = flow_control.clone();
 
         tokio::spawn(async move {
             tracing::trace!("LocalScheduler remote state listener started");
@@ -358,6 +415,9 @@ where
                         }
                         queue_remote_updates.update().await;
                         let _ = queue_updates_remote.send(());
+                        if let Some(flow_control) = flow_control_remote_updates.as_ref() {
+                            flow_control.emit(FlowControlEvent::WorkerLoadChanged { worker: None });
+                        }
                     }
                 }
             }
@@ -395,6 +455,11 @@ where
         request: ScheduleRequest,
     ) -> Result<SchedulingResponse, KvSchedulerError> {
         let ingress_at = StdInstant::now();
+        let request_id = request.mode.request_id().map(str::to_owned);
+        let tracked = request.mode.is_tracked();
+        let mut flow_control_guard = self.flow_control.as_ref().map(|flow_control| {
+            FlowControlRequestGuard::new(Arc::clone(flow_control), request_id, tracked)
+        });
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let lifecycle_lease = self
             .queue
@@ -423,6 +488,9 @@ where
             .map_err(|_| KvSchedulerError::SubscriberShutdown)?;
         if let Some(lease) = lifecycle_lease.as_mut() {
             lease.disarm();
+        }
+        if let (Some(guard), Ok(response)) = (flow_control_guard.as_mut(), response.as_ref()) {
+            guard.selected(response.best_worker);
         }
         response
     }
@@ -589,6 +657,9 @@ where
 
     pub fn register_workers(&self, worker_ids: &HashSet<WorkerId>) {
         self.queue.register_workers(worker_ids);
+        if let Some(flow_control) = self.flow_control.as_ref() {
+            flow_control.emit(FlowControlEvent::Reconcile);
+        }
     }
 
     pub async fn add_request(&self, req: SequenceRequest) -> Result<(), SequenceError> {
@@ -619,6 +690,9 @@ where
                 Some(worker) => self.queue.update_worker(worker).await,
                 None => self.queue.update().await,
             }
+            if let Some(flow_control) = self.flow_control.as_ref() {
+                flow_control.emit(FlowControlEvent::WorkerLoadChanged { worker });
+            }
         }
         Ok(())
     }
@@ -634,6 +708,12 @@ where
             match worker {
                 Some(worker) => self.queue.update_worker(worker).await,
                 None => self.queue.update().await,
+            }
+            if let Some(flow_control) = self.flow_control.as_ref() {
+                flow_control.emit(FlowControlEvent::Completed {
+                    request_id: request_id.clone(),
+                    context_tokens: None,
+                });
             }
         }
         Ok(())
@@ -654,12 +734,24 @@ where
             .free_if_worker(&request_id, worker, Instant::now())?;
         if outcome.is_applied() {
             self.queue.update_worker(worker).await;
+            if let Some(flow_control) = self.flow_control.as_ref() {
+                flow_control.emit(FlowControlEvent::Completed {
+                    request_id: request_id.clone(),
+                    context_tokens: None,
+                });
+            }
         }
         Ok(())
     }
 
     pub fn pending_count(&self) -> usize {
         self.queue.pending_count()
+    }
+
+    pub fn pending_classification_count(&self) -> usize {
+        self.flow_control.as_ref().map_or(0, |flow_control| {
+            flow_control.pending_classification_count()
+        })
     }
 
     pub fn pending_isl_tokens(&self) -> usize {
@@ -672,6 +764,12 @@ where
 
     pub fn supports_overlap_refresh(&self) -> bool {
         self.queue.supports_overlap_refresh()
+    }
+
+    pub async fn wait_for_flow_control_shutdown(&self) {
+        if let Some(flow_control) = self.flow_control.as_ref() {
+            flow_control.wait_for_shutdown().await;
+        }
     }
 
     pub fn worker_type(&self) -> &'static str {
@@ -888,12 +986,13 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{Notify, mpsc, watch};
 
     use super::*;
     use crate::protocols::{ActiveSequenceEvent, ActiveSequenceEventData};
@@ -921,6 +1020,28 @@ mod tests {
 
     struct InspectingFlowControl {
         calls: Arc<AtomicUsize>,
+        events: mpsc::UnboundedSender<FlowControlEvent>,
+    }
+
+    struct PendingFlowControl {
+        entered: Arc<Notify>,
+        events: mpsc::UnboundedSender<FlowControlEvent>,
+    }
+
+    #[async_trait]
+    impl FlowControlPolicy for PendingFlowControl {
+        async fn classify(
+            &self,
+            _request: ClassifyRequest,
+        ) -> Result<Classification, FlowControlPolicyError> {
+            self.entered.notify_one();
+            future::pending().await
+        }
+
+        async fn on_event(&self, event: FlowControlEvent) -> Result<(), FlowControlPolicyError> {
+            self.events.send(event).unwrap();
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -935,6 +1056,11 @@ mod tests {
             assert_eq!(request.scheduling_cost_tokens(), 64);
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(Classification::default().with_scheduling_cost_tokens(7))
+        }
+
+        async fn on_event(&self, event: FlowControlEvent) -> Result<(), FlowControlPolicyError> {
+            self.events.send(event).unwrap();
+            Ok(())
         }
     }
 
@@ -1014,6 +1140,51 @@ mod tests {
         (scheduler, slots, cfg_tx, cancel_token)
     }
 
+    async fn make_flow_control_scheduler(
+        flow_control_config: FlowControlConfig,
+    ) -> (
+        Arc<LocalScheduler<NoopSequencePublisher, SimpleWorkerConfig>>,
+        CancellationToken,
+    ) {
+        let workers = HashMap::from([(
+            0,
+            SimpleWorkerConfig {
+                max_num_batched_tokens: Some(64),
+                ..Default::default()
+            },
+        )]);
+        let slots = Arc::new(ActiveSequencesMultiWorker::new(
+            NoopSequencePublisher,
+            64,
+            HashMap::from([(0, (0, 1))]),
+            false,
+            0,
+            "test",
+        ));
+        let (_cfg_tx, cfg_rx) = watch::channel(workers);
+        let cancel = CancellationToken::new();
+        let scheduler = LocalScheduler::new_with_policy_profile_and_flow_control(
+            slots,
+            cfg_rx,
+            PolicyProfile::synthetic(None, RouterQueuePolicy::Fcfs),
+            64,
+            DefaultWorkerSelector::new(None, "test"),
+            None,
+            None,
+            None,
+            None,
+            Duration::from_secs(60),
+            true,
+            cancel.clone(),
+            "test",
+            false,
+            flow_control_config,
+        )
+        .await
+        .unwrap();
+        (Arc::new(scheduler), cancel)
+    }
+
     fn start_replica_sync(
         slots: &Arc<ActiveSequencesMultiWorker<NoopSequencePublisher>>,
         cancel_token: &CancellationToken,
@@ -1065,46 +1236,14 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_request_classifies_before_entering_order() {
-        let workers = HashMap::from([(
-            0,
-            SimpleWorkerConfig {
-                max_num_batched_tokens: Some(64),
-                ..Default::default()
-            },
-        )]);
-        let slots = Arc::new(ActiveSequencesMultiWorker::new(
-            NoopSequencePublisher,
-            64,
-            HashMap::from([(0, (0, 1))]),
-            false,
-            0,
-            "test",
-        ));
-        let (_cfg_tx, cfg_rx) = watch::channel(workers);
-        let cancel = CancellationToken::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let scheduler: LocalScheduler<NoopSequencePublisher, SimpleWorkerConfig> =
-            LocalScheduler::new_with_policy_profile_and_flow_control(
-                slots,
-                cfg_rx,
-                PolicyProfile::synthetic(None, RouterQueuePolicy::Fcfs),
-                64,
-                DefaultWorkerSelector::new(None, "test"),
-                None,
-                None,
-                None,
-                None,
-                Duration::from_secs(60),
-                true,
-                cancel.clone(),
-                "test",
-                false,
-                FlowControlConfig::new(InspectingFlowControl {
-                    calls: Arc::clone(&calls),
-                }),
-            )
-            .await
-            .unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (scheduler, cancel) =
+            make_flow_control_scheduler(FlowControlConfig::new(InspectingFlowControl {
+                calls: Arc::clone(&calls),
+                events: event_tx,
+            }))
+            .await;
 
         let response = scheduler
             .schedule_request(request(ScheduleMode::Tracked {
@@ -1115,7 +1254,53 @@ mod tests {
 
         assert_eq!(response.best_worker.worker_id, 0);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(FlowControlEvent::Dispatched { request_id, worker })
+                if request_id == "classified" && worker.worker_id == 0
+        ));
+        scheduler.free("classified").await.unwrap();
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(FlowControlEvent::Completed { request_id, .. })
+                if request_id == "classified"
+        ));
         cancel.cancel();
+        scheduler.wait_for_flow_control_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_schedule_request_aborts_its_pending_classifier() {
+        let entered = Arc::new(Notify::new());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (scheduler, cancel) =
+            make_flow_control_scheduler(FlowControlConfig::new(PendingFlowControl {
+                entered: Arc::clone(&entered),
+                events: event_tx,
+            }))
+            .await;
+        let request_scheduler = Arc::clone(&scheduler);
+        let schedule = tokio::spawn(async move {
+            request_scheduler
+                .schedule_request(request(ScheduleMode::Tracked {
+                    request_id: "cancelled".to_string(),
+                }))
+                .await
+        });
+        entered.notified().await;
+
+        schedule.abort();
+        assert!(schedule.await.unwrap_err().is_cancelled());
+        let event = tokio::time::timeout(Duration::from_millis(250), event_rx.recv())
+            .await
+            .unwrap();
+        assert!(matches!(
+            event,
+            Some(FlowControlEvent::Aborted { request_id }) if request_id == "cancelled"
+        ));
+
+        cancel.cancel();
+        scheduler.wait_for_flow_control_shutdown().await;
     }
 
     #[tokio::test]
