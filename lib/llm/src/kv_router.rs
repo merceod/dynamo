@@ -1363,6 +1363,7 @@ where
 
         let schedule_request = ScheduleRequest {
             mode,
+            deadline: None,
             token_seq: maybe_seq_hashes,
             block_hashes: block_hashes_for_refresh,
             isl_tokens,

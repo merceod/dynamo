@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use crossbeam_queue::SegQueue;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -13,6 +13,7 @@ use tokio::time::Instant;
 
 use super::config::RouterQueuePolicy;
 use super::filter::RoutingEligibility;
+use super::flow_control::{Classification, ClassifyRequest};
 use super::overlap::SelectedWorkerTierSnapshot;
 use super::overlap_refresh::{
     NoopOverlapScoresRefresh, OverlapScoresRefresh, read_overlap_refresh_after, refresh_overlap,
@@ -55,7 +56,16 @@ pub struct ClassQueueStats {
 struct QueuedRequest {
     request: SchedulingRequest,
     enqueue_at: Instant,
+    due_at: Option<Instant>,
     block_hashes: Option<Vec<LocalBlockHash>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderMetadata {
+    class_index: usize,
+    snapshot: QueueSnapshot,
+    due_at: Option<Instant>,
+    arrival_offset_secs: f64,
 }
 
 struct SelectedWorkerForRequest {
@@ -126,6 +136,7 @@ enum AdmissionCommand {
     Enqueue {
         request: SchedulingRequest,
         block_hashes: Option<Vec<LocalBlockHash>>,
+        order: OrderMetadata,
         lease: Option<Box<RequestLifecycleLease>>,
         ack_tx: oneshot::Sender<Option<Box<RequestLifecycleLease>>>,
     },
@@ -227,7 +238,6 @@ struct SchedulerQueueActor<
     class_counters: Arc<Vec<ClassQueueCounters>>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
-    start_time: Instant,
     block_size: u32,
     selector: Sel,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
@@ -238,10 +248,9 @@ struct SchedulerQueueActor<
     non_max_overlap_selection_observer: Arc<OnceLock<NonMaxOverlapSelectionObserver>>,
 }
 
-/// Queue that gates scheduling requests behind a capacity check.
-/// When all workers exceed `threshold_frac` utilisation the request is parked in `pending`.
-/// When capacity frees up (`update()`), pending requests are scheduled in priority order.
-/// If queueing is disabled (threshold_frac is None), requests are scheduled immediately.
+/// Router-owned Order stage between request classification and worker placement.
+/// Every request enters the policy queue. Capacity-ready requests may enqueue and
+/// leave Order in the same actor turn; the remainder stay pending until an update.
 pub struct SchedulerQueue<
     P: SequencePublisher,
     C: WorkerConfigLike,
@@ -259,6 +268,8 @@ pub struct SchedulerQueue<
     class_counters: Arc<Vec<ClassQueueCounters>>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
+    profile: PolicyProfile,
+    start_time: StdInstant,
     queueing_enabled: bool,
     supports_overlap_refresh: bool,
     non_max_overlap_selection_observer: Arc<OnceLock<NonMaxOverlapSelectionObserver>>,
@@ -385,17 +396,17 @@ impl<
         let (admission_tx, admission_rx) = mpsc::channel(admission_channel_capacity);
         let cleanup = Arc::new(AdmissionCleanup::default());
         let non_max_overlap_selection_observer = Arc::new(OnceLock::new());
+        let start_time = StdInstant::now();
         let actor = SchedulerQueueActor {
             pending,
             cleanup: Arc::clone(&cleanup),
             queueing_enabled,
-            profile,
+            profile: profile.clone(),
             pending_count: Arc::clone(&pending_count),
             pending_isl_tokens: Arc::clone(&pending_isl_tokens),
             class_counters: Arc::clone(&class_counters),
             slots: Arc::clone(&slots),
             workers_with_configs: workers_with_configs.clone(),
-            start_time: Instant::now(),
             block_size,
             selector,
             prefill_load_estimator,
@@ -414,6 +425,8 @@ impl<
             class_counters,
             slots,
             workers_with_configs,
+            profile,
+            start_time,
             queueing_enabled,
             supports_overlap_refresh: overlap_refresh_after.is_some(),
             non_max_overlap_selection_observer,
@@ -539,9 +552,27 @@ impl<
 
     pub(crate) async fn enqueue_with_block_hashes_and_lease(
         &self,
+        request: SchedulingRequest,
+        block_hashes: Option<Vec<LocalBlockHash>>,
+        lease: Option<Box<RequestLifecycleLease>>,
+    ) -> Option<Box<RequestLifecycleLease>> {
+        self.enqueue_classified_with_block_hashes_and_lease(
+            request,
+            block_hashes,
+            lease,
+            None,
+            StdInstant::now(),
+        )
+        .await
+    }
+
+    pub(crate) async fn enqueue_classified_with_block_hashes_and_lease(
+        &self,
         mut request: SchedulingRequest,
         block_hashes: Option<Vec<LocalBlockHash>>,
         lease: Option<Box<RequestLifecycleLease>>,
+        classification: Option<Classification>,
+        ingress_at: StdInstant,
     ) -> Option<Box<RequestLifecycleLease>> {
         if self.queueing_enabled && lease.is_none() && request.mode.lifecycle_request_id().is_some()
         {
@@ -550,6 +581,14 @@ impl<
             )));
             return None;
         }
+
+        let order = match self.order_metadata(&request, classification, ingress_at) {
+            Ok(order) => order,
+            Err(error) => {
+                request.respond(Err(error));
+                return None;
+            }
+        };
 
         let eligibility = request.eligibility();
 
@@ -562,6 +601,7 @@ impl<
         let command = AdmissionCommand::Enqueue {
             request,
             block_hashes: self.prepare_block_hashes_for_refresh(block_hashes),
+            order,
             lease,
             ack_tx,
         };
@@ -581,6 +621,98 @@ impl<
                 None
             }
         }
+    }
+
+    pub(crate) fn classify_request(
+        &self,
+        request: &SchedulingRequest,
+        ingress_at: StdInstant,
+    ) -> ClassifyRequest {
+        let snapshot = self.snapshot_for(request);
+        let mut classify = ClassifyRequest::new(
+            ingress_at,
+            snapshot.raw_isl_tokens,
+            snapshot.cached_tokens,
+            snapshot.scheduling_cost_tokens,
+        );
+        if let Some(request_id) = request.mode.request_id() {
+            classify = classify.with_request_id(request_id);
+        }
+        if let Some(policy_class) = request.policy_class.as_deref() {
+            classify = classify.with_policy_class(policy_class);
+        }
+        if let Some(deadline) = request.deadline {
+            classify = classify.with_deadline(deadline);
+        }
+        if let Some(session_context) = request.session_context.clone() {
+            classify = classify.with_session_context(session_context);
+        }
+        classify
+    }
+
+    fn order_metadata(
+        &self,
+        request: &SchedulingRequest,
+        classification: Option<Classification>,
+        ingress_at: StdInstant,
+    ) -> Result<OrderMetadata, KvSchedulerError> {
+        let snapshot = self.snapshot_for(request);
+        let (policy_class, due_at, scheduling_cost_tokens) = classification
+            .map(Classification::into_parts)
+            .unwrap_or_default();
+
+        if scheduling_cost_tokens == Some(0) {
+            return Err(KvSchedulerError::InvalidFlowControlMetadata(
+                "scheduling cost must be greater than zero".to_string(),
+            ));
+        }
+        if let (Some(due_at), Some(deadline)) = (due_at, request.deadline)
+            && due_at > deadline
+        {
+            return Err(KvSchedulerError::InvalidFlowControlMetadata(
+                "due time extends the authoritative request deadline".to_string(),
+            ));
+        }
+
+        let due_at = due_at.or(request.deadline);
+        if due_at.is_some_and(|due_at| due_at <= StdInstant::now()) {
+            return Err(KvSchedulerError::DeadlineExceeded);
+        }
+
+        let class_index = match policy_class {
+            Some(policy_class) => {
+                self.profile
+                    .class_index_by_name(&policy_class)
+                    .ok_or_else(|| {
+                        KvSchedulerError::InvalidFlowControlMetadata(format!(
+                            "unknown policy class {policy_class:?}"
+                        ))
+                    })?
+            }
+            None => self
+                .profile
+                .resolve_class_index(request.policy_class.as_deref(), snapshot.uncached_tokens),
+        };
+        let snapshot = QueueSnapshot {
+            scheduling_cost_tokens: scheduling_cost_tokens
+                .unwrap_or(snapshot.scheduling_cost_tokens),
+            ..snapshot
+        };
+
+        Ok(OrderMetadata {
+            class_index,
+            snapshot,
+            due_at: due_at.map(Instant::from_std),
+            arrival_offset_secs: ingress_at
+                .saturating_duration_since(self.start_time)
+                .as_secs_f64(),
+        })
+    }
+
+    fn snapshot_for(&self, request: &SchedulingRequest) -> QueueSnapshot {
+        let workers = self.workers_with_configs.borrow();
+        let context = SchedulingContext::new(request, &workers);
+        QueueSnapshot::new(request.isl_tokens, context.best_cached_tokens())
     }
 
     pub(crate) fn new_request_lifecycle_lease(
@@ -702,6 +834,7 @@ impl<
                 AdmissionCommand::Enqueue {
                     request,
                     block_hashes,
+                    order,
                     mut lease,
                     ack_tx,
                 } => {
@@ -709,7 +842,7 @@ impl<
                         .as_ref()
                         .and_then(|_| request.mode.tracked_request_id().map(str::to_owned));
                     let (enqueue_ready, owns_lifecycle) =
-                        self.handle_enqueue(request, block_hashes);
+                        self.handle_enqueue(request, block_hashes, order);
                     if let Some(lease) = lease.as_mut()
                         && owns_lifecycle
                     {
@@ -764,36 +897,20 @@ impl<
 
     fn handle_enqueue(
         &mut self,
-        request: SchedulingRequest,
+        mut request: SchedulingRequest,
         block_hashes: Option<Vec<LocalBlockHash>>,
+        order: OrderMetadata,
     ) -> (bool, bool) {
         let decay_now = Instant::now();
-        // Synthetic and explicit selections avoid cache work. Family classification
-        // samples overlap once and reuses it if the request enters queue storage.
-        let (class_index, snapshot) = if let Some(class_index) = self
-            .profile
-            .direct_class_index(request.policy_class.as_deref())
-        {
-            (class_index, None)
-        } else {
-            let workers = self.workers_with_configs.borrow();
-            let snapshot = Self::snapshot_for_with(&request, &workers);
-            let class_index = self
-                .profile
-                .resolve_class_index(request.policy_class.as_deref(), snapshot.uncached_tokens);
-            (class_index, Some(snapshot))
-        };
-        let class = self.profile.class(class_index);
-        let should_queue = self.should_queue(class_index, class, || {
-            self.all_workers_prefill_busy(class, request.eligibility(), decay_now)
-        });
-        if !should_queue {
-            return (false, self.admit_one(request, decay_now));
+        if order.due_at.is_some_and(|due_at| due_at <= decay_now) {
+            request.respond(Err(KvSchedulerError::DeadlineExceeded));
+            return (false, false);
         }
 
-        let snapshot = snapshot.unwrap_or_else(|| self.snapshot_for(&request));
-        tracing::debug!(policy_class = class.name, "queueing request");
-        let arrival_offset = self.start_time.elapsed().as_secs_f64();
+        let class_index = order.class_index;
+        let class = self.profile.class(class_index);
+        let snapshot = order.snapshot;
+        tracing::debug!(policy_class = class.name, "ordering request");
         let priority_jump = request.priority_jump;
         let strict_priority = request.strict_priority;
         let placement = request
@@ -802,16 +919,18 @@ impl<
         let queued = QueuedRequest {
             request,
             enqueue_at: decay_now,
+            due_at: order.due_at,
             block_hashes,
         };
         let worker_count = self.workers_with_configs.borrow().len();
-        if let Err((rejection, queued)) = self.pending.enqueue(
+        if let Err((rejection, queued)) = self.pending.enqueue_with_due_at(
             class_index,
             worker_count,
             snapshot,
-            arrival_offset,
+            order.arrival_offset_secs,
             priority_jump,
             strict_priority,
+            order.due_at.map(Instant::into_std),
             placement,
             queued,
         ) {
@@ -823,33 +942,7 @@ impl<
         self.pending_isl_tokens
             .fetch_add(snapshot.raw_isl_tokens, AtomicOrdering::Relaxed);
         self.add_class_counters(class_index, snapshot);
-        (false, true)
-    }
-
-    fn should_queue(
-        &self,
-        class_index: usize,
-        class: &PolicyClassConfig,
-        all_workers_busy: impl FnOnce() -> bool,
-    ) -> bool {
-        // Preserve backlog anti-bypass and lazily avoid worker scans when an
-        // earlier condition already decides admission.
-        class.queueing_enabled() && (self.pending.has_backlog(class_index) || all_workers_busy())
-    }
-
-    fn snapshot_for(&self, request: &SchedulingRequest) -> QueueSnapshot {
-        let workers = self.workers_with_configs.borrow();
-        Self::snapshot_for_with(request, &workers)
-    }
-
-    fn snapshot_for_with(
-        request: &SchedulingRequest,
-        workers: &HashMap<WorkerId, C>,
-    ) -> QueueSnapshot {
-        // Cache overlap is sampled once and reused for classification, queue
-        // limits, ordering, DRR cost, and counters.
-        let context = SchedulingContext::new(request, workers);
-        QueueSnapshot::new(request.isl_tokens, context.best_cached_tokens())
+        (true, true)
     }
 
     fn drain_cleanup(&mut self) -> bool {
@@ -892,14 +985,16 @@ impl<
 
     fn has_dispatchable_ready_head(&self) -> bool {
         let active_tokens = self.slots.active_tokens(Instant::now());
+        let now = Instant::now();
         let configs = self.workers_with_configs.borrow();
         self.pending.any_ready_head(|_, class, queued| {
-            !Self::all_workers_prefill_busy_with(
-                &active_tokens,
-                &configs,
-                class,
-                queued.request.eligibility(),
-            )
+            queued.due_at.is_some_and(|due_at| due_at <= now)
+                || !Self::all_workers_prefill_busy_with(
+                    &active_tokens,
+                    &configs,
+                    class,
+                    queued.request.eligibility(),
+                )
         })
     }
 
@@ -934,12 +1029,13 @@ impl<
                     // TODO: This preserves head-of-line blocking within each policy
                     // class. A blocked constrained head can stall later entries in
                     // that class until a bounded non-HOL policy is introduced.
-                    !Self::all_workers_prefill_busy_with(
-                        &active_tokens,
-                        &configs,
-                        class,
-                        queued.request.eligibility(),
-                    )
+                    queued.due_at.is_some_and(|due_at| due_at <= decay_now)
+                        || !Self::all_workers_prefill_busy_with(
+                            &active_tokens,
+                            &configs,
+                            class,
+                            queued.request.eligibility(),
+                        )
                 })
             };
             let Some(mut popped) = popped else {
@@ -962,6 +1058,20 @@ impl<
             self.pending_isl_tokens
                 .fetch_sub(snapshot.raw_isl_tokens, AtomicOrdering::Relaxed);
             self.subtract_class_counters(popped.class_index(), snapshot);
+            if popped
+                .due_at()
+                .is_some_and(|due_at| due_at <= decay_now.into_std())
+            {
+                let class_index = popped.class_index();
+                let class = self.profile.class(class_index);
+                let mut request = popped.into_payload().request;
+                tracing::debug!(
+                    policy_class = class.name,
+                    "rejecting expired request from order"
+                );
+                request.respond(Err(KvSchedulerError::DeadlineExceeded));
+                continue;
+            }
             let queued = popped.payload_mut();
             // NOTE: Overlap refresh is expected to be very short. We intentionally
             // accept load crossing the class threshold during this await: busy
@@ -1243,23 +1353,6 @@ impl<
             initial_effective_prefill_tokens: effective_isl,
             expected_prefill_duration,
         })
-    }
-
-    /// Check if all eligible workers are prefill-busy based on threshold.
-    /// When `pinned_worker` is `Some`, only that exact worker/rank is considered.
-    /// Otherwise when `allowed` is `Some`, only those worker IDs are considered;
-    /// otherwise all registered workers are checked.
-    /// Returns false when no eligible workers exist so the request falls
-    /// through to `schedule`, which returns a proper `NoEndpoints` error.
-    fn all_workers_prefill_busy(
-        &self,
-        class: &PolicyClassConfig,
-        eligibility: RoutingEligibility<'_>,
-        decay_now: Instant,
-    ) -> bool {
-        let active_tokens = self.slots.active_tokens(decay_now);
-        let configs = self.workers_with_configs.borrow();
-        Self::all_workers_prefill_busy_with(&active_tokens, &configs, class, eligibility)
     }
 
     fn all_workers_prefill_busy_with(
@@ -1888,6 +1981,7 @@ mod tests {
             mode: ScheduleMode::Tracked {
                 request_id: request_id.to_string(),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens,
             overlap: OverlapSignals::default(),
@@ -1909,6 +2003,83 @@ mod tests {
             resp_tx: Some(tx),
         };
         (req, rx)
+    }
+
+    #[tokio::test]
+    async fn order_handoff_validates_and_snapshots_classifier_metadata() {
+        let profile = policy_profile(
+            r#"
+default_policy_family: latency
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: latency
+    policy_family: latency
+    cache_bucket: all
+    quantum: 1
+  - name: bulk
+    policy_family: bulk
+    cache_bucket: all
+    quantum: 1
+"#,
+        );
+        let (queue, _slots) = make_queue_with_profile(1, 16, 64, profile);
+        let (mut request, _rx) = make_request("classified", 64);
+        let now = StdInstant::now();
+        let deadline = now + Duration::from_secs(30);
+        let due_at = now + Duration::from_secs(20);
+        request.deadline = Some(deadline);
+
+        let order = queue
+            .order_metadata(
+                &request,
+                Some(
+                    Classification::default()
+                        .with_policy_class("bulk")
+                        .with_due_at(due_at)
+                        .with_scheduling_cost_tokens(7),
+                ),
+                now,
+            )
+            .unwrap();
+        assert_eq!(queue.profile.class(order.class_index).name, "bulk");
+        assert_eq!(order.snapshot.scheduling_cost_tokens, 7);
+        assert_eq!(order.due_at.map(Instant::into_std), Some(due_at));
+
+        request.policy_class = Some("unmatched-baseline".to_string());
+        let baseline = queue.order_metadata(&request, None, now).unwrap();
+        assert_eq!(queue.profile.class(baseline.class_index).name, "latency");
+
+        let invalid_class = queue.order_metadata(
+            &request,
+            Some(Classification::default().with_policy_class("missing")),
+            now,
+        );
+        assert!(matches!(
+            invalid_class,
+            Err(KvSchedulerError::InvalidFlowControlMetadata(_))
+        ));
+
+        let zero_cost = queue.order_metadata(
+            &request,
+            Some(Classification::default().with_scheduling_cost_tokens(0)),
+            now,
+        );
+        assert!(matches!(
+            zero_cost,
+            Err(KvSchedulerError::InvalidFlowControlMetadata(_))
+        ));
+
+        let extended_deadline = queue.order_metadata(
+            &request,
+            Some(Classification::default().with_due_at(deadline + Duration::from_secs(1))),
+            now,
+        );
+        assert!(matches!(
+            extended_deadline,
+            Err(KvSchedulerError::InvalidFlowControlMetadata(_))
+        ));
     }
 
     #[test]
@@ -2493,21 +2664,14 @@ policy_classes:
         queue.enqueue(queued_second).await;
         assert_eq!(
             queue.pending_count(),
-            2,
-            "new arrivals must not bypass backlog"
+            1,
+            "new arrivals must enter order behind the existing head"
         );
-        assert!(queued_first_rx.try_recv().is_err());
-        assert!(queued_second_rx.try_recv().is_err());
-
-        queue.update().await;
         queued_first_rx
             .try_recv()
-            .expect("first queued request should be admitted")
+            .expect("existing head should use available capacity")
             .expect("first queued request failed");
-        assert!(
-            queued_second_rx.try_recv().is_err(),
-            "second request should remain behind the admitted head"
-        );
+        assert!(queued_second_rx.try_recv().is_err());
 
         slots
             .mark_prefill_completed(&"queued-first".to_string(), decay_now())
@@ -2704,7 +2868,7 @@ policy_classes:
         queue.enqueue(active).await;
         active_rx.await.unwrap().unwrap();
 
-        let (first, _first_rx) = make_request("first", 64);
+        let (first, mut first_rx) = make_request("first", 64);
         queue.enqueue(first).await;
 
         cfg_tx.send_modify(|configs| {
@@ -2716,9 +2880,14 @@ policy_classes:
                 },
             );
         });
-        let (second, _second_rx) = make_request("second", 64);
+        let (second, mut second_rx) = make_request("second", 64);
         queue.enqueue(second).await;
-        assert_eq!(queue.pending_count(), 2);
+        first_rx
+            .try_recv()
+            .expect("existing head should use newly discovered capacity")
+            .expect("first request failed");
+        assert!(second_rx.try_recv().is_err());
+        assert_eq!(queue.pending_count(), 1);
 
         cfg_tx.send_modify(|configs| {
             configs.remove(&1);
@@ -2729,9 +2898,9 @@ policy_classes:
         let KvSchedulerError::QueueRejected(rejection) = error else {
             panic!("expected queue rejection, got {error:?}");
         };
-        assert_eq!(rejection.current, 2);
+        assert_eq!(rejection.current, 1);
         assert_eq!(rejection.limit, 1);
-        assert_eq!(queue.pending_count(), 2);
+        assert_eq!(queue.pending_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2947,12 +3116,11 @@ policy_classes:
         queue.enqueue(allowed).await;
         assert_eq!(
             queue.pending_count(),
-            2,
-            "allow-list request must not bypass the existing class backlog"
+            1,
+            "the existing head should dispatch before the new allow-list request"
         );
         assert!(allowed_rx.try_recv().is_err());
 
-        queue.update().await;
         let backlog_head_worker = backlog_head_rx
             .await
             .unwrap()
@@ -3059,10 +3227,6 @@ policy_classes:
         let (mut other_worker, mut other_worker_rx) = make_request("pinned-0", 256);
         other_worker.pinned_worker = Some(WorkerWithDpRank::new(0, 0));
         queue.enqueue(other_worker).await;
-        assert_eq!(queue.pending_count(), 2);
-
-        queue.update().await;
-
         assert_eq!(queue.pending_count(), 1);
         let other_worker_resp = other_worker_rx
             .try_recv()

@@ -65,10 +65,14 @@ fn scheduler_error_status(error: &KvSchedulerError) -> StatusCode {
         | KvSchedulerError::AllEligibleWorkersFiltered
         | KvSchedulerError::SubscriberShutdown
         | KvSchedulerError::InitFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
-        KvSchedulerError::WorkerSelectionPolicy(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        KvSchedulerError::WorkerSelectionPolicy(_)
+        | KvSchedulerError::FlowControlPolicy(_)
+        | KvSchedulerError::InvalidFlowControlMetadata(_) => StatusCode::INTERNAL_SERVER_ERROR,
         KvSchedulerError::AllEligibleWorkersOverloaded
-        | KvSchedulerError::PinnedWorkerOverloaded { .. } => StatusCode::TOO_MANY_REQUESTS,
-        KvSchedulerError::QueueRejected(_) => StatusCode::SERVICE_UNAVAILABLE,
+        | KvSchedulerError::PinnedWorkerOverloaded { .. }
+        | KvSchedulerError::FlowControlPendingLimit { .. }
+        | KvSchedulerError::QueueRejected(_)
+        | KvSchedulerError::DeadlineExceeded => StatusCode::TOO_MANY_REQUESTS,
         KvSchedulerError::PinnedWorkerNotAllowed { .. } => StatusCode::BAD_REQUEST,
         KvSchedulerError::BookingFailed(_) => StatusCode::CONFLICT,
     }
@@ -117,6 +121,15 @@ mod tests {
         );
         assert_eq!(
             SelectionError::Scheduler(KvSchedulerError::AllEligibleWorkersOverloaded).status_code(),
+            StatusCode::TOO_MANY_REQUESTS.as_u16()
+        );
+        assert_eq!(
+            SelectionError::Scheduler(KvSchedulerError::FlowControlPendingLimit { limit: 1 })
+                .status_code(),
+            StatusCode::TOO_MANY_REQUESTS.as_u16()
+        );
+        assert_eq!(
+            SelectionError::Scheduler(KvSchedulerError::DeadlineExceeded).status_code(),
             StatusCode::TOO_MANY_REQUESTS.as_u16()
         );
     }

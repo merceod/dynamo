@@ -177,6 +177,7 @@ fn fixture_with_preferred_taints(
 
     let request = SchedulingRequest {
         mode: ScheduleMode::QueryOnly { request_id: None },
+        deadline: None,
         token_seq: None,
         isl_tokens: 2_048,
         lora_name: None,

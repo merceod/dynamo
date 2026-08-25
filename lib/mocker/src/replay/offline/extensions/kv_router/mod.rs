@@ -290,6 +290,7 @@ impl PendingRequest {
             mode: ScheduleMode::Tracked {
                 request_id: self.request_id(),
             },
+            deadline: None,
             token_seq: self.token_seq.clone(),
             isl_tokens: self.isl_tokens,
             overlap: OverlapSignals {

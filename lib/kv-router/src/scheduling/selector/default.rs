@@ -735,6 +735,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
@@ -1062,6 +1063,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
@@ -1120,6 +1122,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
@@ -1196,6 +1199,7 @@ mod tests {
                 mode: ScheduleMode::QueryOnly {
                     request_id: Some("test".into()),
                 },
+                deadline: None,
                 token_seq: None,
                 isl_tokens: 16,
                 overlap: OverlapSignals {
@@ -1270,6 +1274,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
@@ -1340,6 +1345,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens: 16,
             overlap: OverlapSignals {
@@ -1426,6 +1432,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens: isl,
             overlap: OverlapSignals {
@@ -1503,6 +1510,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens: isl,
             overlap: OverlapSignals {
@@ -1804,6 +1812,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens: isl,
             overlap: OverlapSignals {
@@ -1893,6 +1902,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens: isl,
             overlap: OverlapSignals {

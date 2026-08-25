@@ -784,6 +784,7 @@ impl SelectionCore {
         let response_track_prefill_tokens = book.then_some(track_prefill_tokens);
         let schedule_request = ScheduleRequest {
             mode,
+            deadline: None,
             token_seq: Some(sequence_hashes),
             block_hashes: Some(block_hashes),
             isl_tokens,

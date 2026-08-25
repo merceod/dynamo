@@ -149,6 +149,7 @@ mod tests {
     fn request() -> SchedulingRequest {
         SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
+            deadline: None,
             token_seq: None,
             isl_tokens: 16,
             lora_name: None,

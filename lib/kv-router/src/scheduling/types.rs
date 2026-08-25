@@ -95,13 +95,27 @@ pub enum KvSchedulerError {
 
     #[error(transparent)]
     WorkerSelectionPolicy(#[from] WorkerSelectionPolicyError),
+
+    #[error("flow-control policy failed: {0}")]
+    FlowControlPolicy(super::flow_control::FlowControlPolicyError),
+
+    #[error("flow-control pending-classification limit reached (limit={limit})")]
+    FlowControlPendingLimit { limit: usize },
+
+    #[error("request deadline exceeded")]
+    DeadlineExceeded,
+
+    #[error("invalid flow-control scheduling metadata: {0}")]
+    InvalidFlowControlMetadata(String),
 }
 
 impl KvSchedulerError {
     pub fn is_overload(&self) -> bool {
         matches!(
             self,
-            Self::AllEligibleWorkersOverloaded | Self::PinnedWorkerOverloaded { .. }
+            Self::AllEligibleWorkersOverloaded
+                | Self::PinnedWorkerOverloaded { .. }
+                | Self::FlowControlPendingLimit { .. }
         )
     }
 }
@@ -330,6 +344,9 @@ impl SessionContext {
 /// Validated request accepted by [`LocalScheduler`](super::LocalScheduler).
 pub struct ScheduleRequest {
     pub mode: ScheduleMode,
+    /// Authoritative caller deadline. Flow-control policies may shorten, but
+    /// never extend, this deadline.
+    pub deadline: Option<std::time::Instant>,
     pub token_seq: Option<Vec<SequenceHash>>,
     pub block_hashes: Option<Vec<LocalBlockHash>>,
     pub isl_tokens: usize,
@@ -357,6 +374,7 @@ pub struct ScheduleRequest {
 pub struct SchedulingRequest {
     // Request identity and payload.
     pub mode: ScheduleMode,
+    pub deadline: Option<std::time::Instant>,
     pub token_seq: Option<Vec<SequenceHash>>,
     pub isl_tokens: usize,
     pub lora_name: Option<String>,
@@ -531,6 +549,7 @@ mod tests {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq,
             isl_tokens,
             lora_name: None,

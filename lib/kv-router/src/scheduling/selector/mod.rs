@@ -490,6 +490,7 @@ mod test_support {
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
+            deadline: None,
             token_seq: None,
             isl_tokens,
             overlap: OverlapSignals {

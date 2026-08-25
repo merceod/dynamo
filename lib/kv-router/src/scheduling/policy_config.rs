@@ -160,6 +160,10 @@ impl PolicyProfile {
     pub fn class(&self, index: usize) -> &PolicyClassConfig {
         &self.classes[index]
     }
+
+    pub(crate) fn class_index_by_name(&self, name: &str) -> Option<usize> {
+        self.classes.iter().position(|class| class.name == name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

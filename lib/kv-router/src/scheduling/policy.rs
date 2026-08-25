@@ -205,6 +205,7 @@ mod tests {
             .collect();
         SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
+            deadline: None,
             token_seq: None,
             isl_tokens,
             overlap: OverlapSignals {
