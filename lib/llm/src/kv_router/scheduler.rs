@@ -6,7 +6,8 @@ pub use dynamo_kv_router::scheduling::overlap_refresh::{
     NoopOverlapScoresRefresh, OverlapScoresRefresh, RefreshedOverlap,
 };
 pub use dynamo_kv_router::scheduling::{
-    AdvisorySchedulingResponse, KvSchedulerError, LocalScheduler, NonMaxOverlapSelectionObserver,
+    AdvisorySchedulingResponse, FlowControlConfig, FlowControlEvent, FlowControlPolicy,
+    FlowControlPolicyError, KvSchedulerError, LocalScheduler, NonMaxOverlapSelectionObserver,
     OverloadedWorkerProvider, PotentialLoad, ScheduleRequest, SchedulingRequest,
     SchedulingResponse, TierOverlapBlocks, WorkerAvailabilityProvider,
 };
@@ -66,6 +67,75 @@ where
         worker_type: &'static str,
         cancellation_token: CancellationToken,
     ) -> Result<Self, KvSchedulerError> {
+        Self::start_inner(
+            endpoint,
+            block_size,
+            workers_with_configs,
+            selector,
+            kv_router_config,
+            prefill_load_estimator,
+            overlap_scores_refresh,
+            overloaded_worker_provider,
+            available_worker_provider,
+            model_name,
+            worker_type,
+            cancellation_token,
+            None,
+        )
+        .await
+    }
+
+    /// Start the scheduler with one programmatically supplied flow-control policy.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn start_with_flow_control(
+        endpoint: Endpoint,
+        block_size: u32,
+        workers_with_configs: RuntimeConfigWatch,
+        selector: Sel,
+        kv_router_config: &KvRouterConfig,
+        prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+        overlap_scores_refresh: Option<Arc<RF>>,
+        overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        available_worker_provider: Option<WorkerAvailabilityProvider>,
+        model_name: Option<&str>,
+        worker_type: &'static str,
+        cancellation_token: CancellationToken,
+        flow_control_config: FlowControlConfig,
+    ) -> Result<Self, KvSchedulerError> {
+        Self::start_inner(
+            endpoint,
+            block_size,
+            workers_with_configs,
+            selector,
+            kv_router_config,
+            prefill_load_estimator,
+            overlap_scores_refresh,
+            overloaded_worker_provider,
+            available_worker_provider,
+            model_name,
+            worker_type,
+            cancellation_token,
+            Some(flow_control_config),
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn start_inner(
+        endpoint: Endpoint,
+        block_size: u32,
+        workers_with_configs: RuntimeConfigWatch,
+        selector: Sel,
+        kv_router_config: &KvRouterConfig,
+        prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+        overlap_scores_refresh: Option<Arc<RF>>,
+        overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        available_worker_provider: Option<WorkerAvailabilityProvider>,
+        model_name: Option<&str>,
+        worker_type: &'static str,
+        cancellation_token: CancellationToken,
+        flow_control_config: Option<FlowControlConfig>,
+    ) -> Result<Self, KvSchedulerError> {
         let initial_workers: HashMap<WorkerId, ModelRuntimeConfig> =
             workers_with_configs.borrow().clone();
 
@@ -103,22 +173,44 @@ where
             .map(|(index, class)| (class.name.clone(), index))
             .collect();
 
-        let inner = Arc::new(LocalScheduler::new_with_policy_profile(
-            slots,
-            workers_with_configs.clone(),
-            profile,
-            block_size,
-            selector,
-            prefill_load_estimator,
-            overlap_scores_refresh,
-            overloaded_worker_provider,
-            available_worker_provider,
-            queue_recheck_interval,
-            kv_router_config.router_track_prefill_tokens,
-            cancellation_token.child_token(),
-            worker_type,
-            watch_worker_configs,
-        )?);
+        let inner = Arc::new(match flow_control_config {
+            Some(flow_control_config) => {
+                LocalScheduler::new_with_policy_profile_and_flow_control(
+                    slots,
+                    workers_with_configs.clone(),
+                    profile,
+                    block_size,
+                    selector,
+                    prefill_load_estimator,
+                    overlap_scores_refresh,
+                    overloaded_worker_provider,
+                    available_worker_provider,
+                    queue_recheck_interval,
+                    kv_router_config.router_track_prefill_tokens,
+                    cancellation_token.child_token(),
+                    worker_type,
+                    watch_worker_configs,
+                    flow_control_config,
+                )
+                .await?
+            }
+            None => LocalScheduler::new_with_policy_profile(
+                slots,
+                workers_with_configs.clone(),
+                profile,
+                block_size,
+                selector,
+                prefill_load_estimator,
+                overlap_scores_refresh,
+                overloaded_worker_provider,
+                available_worker_provider,
+                queue_recheck_interval,
+                kv_router_config.router_track_prefill_tokens,
+                cancellation_token.child_token(),
+                worker_type,
+                watch_worker_configs,
+            )?,
+        });
         if worker_type == WORKER_TYPE_PREFILL {
             let locality_observer: NonMaxOverlapSelectionObserver =
                 Arc::new(move |request_id, selection| {
@@ -395,8 +487,16 @@ where
         self.inner.pending_count()
     }
 
+    pub fn pending_classification_count(&self) -> usize {
+        self.inner.pending_classification_count()
+    }
+
     pub fn pending_isl_tokens(&self) -> usize {
         self.inner.pending_isl_tokens()
+    }
+
+    pub async fn wait_for_flow_control_shutdown(&self) {
+        self.inner.wait_for_flow_control_shutdown().await;
     }
 
     pub fn worker_type(&self) -> &'static str {
