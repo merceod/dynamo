@@ -13,6 +13,7 @@ members = [
     "lib/mocker",
     "lib/kv-router",
     "lib/router-plugins/catalog",
+    "examples/router/task-width-flow-control",
     "examples/router/custom-policy-example/simple-filter-score-pick",
     "examples/router/custom-policy-example/catalog",
     "examples/router/custom-policy-example/disagg-filter-score-pick",
@@ -213,4 +214,3 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
-

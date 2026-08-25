@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-task-width-flow-control-example"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Task-width flow-control policy example for Dynamo"
+
+[dependencies]
+async-trait.workspace = true
+dynamo-kv-router.workspace = true
+tokio.workspace = true
