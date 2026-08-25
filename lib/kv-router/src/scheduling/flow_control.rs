@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::num::NonZeroUsize;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 
 use super::SessionContext;
 use super::types::KvSchedulerError;
@@ -291,10 +292,10 @@ impl FlowControlRuntime {
         shutdown: CancellationToken,
     ) -> Result<Arc<Self>, KvSchedulerError> {
         let init_policy = Arc::clone(&config.policy);
-        let mut init =
-            AbortOnDropHandle::new(tokio::spawn(async move { init_policy.init().await }));
+        let init = AssertUnwindSafe(async move { init_policy.init().await }).catch_unwind();
+        tokio::pin!(init);
         tokio::select! {
-            result = &mut init => map_policy_task_result("init", result)?,
+            result = &mut init => map_policy_future_result("init", result)?,
             _ = shutdown.cancelled() => return Err(KvSchedulerError::SubscriberShutdown),
         }
 
@@ -348,14 +349,16 @@ impl FlowControlRuntime {
         }
         let permit = self.acquire_classification_permit()?;
         let policy = Arc::clone(&self.policy);
-        let mut classify = AbortOnDropHandle::new(tokio::spawn(async move {
+        let classify = AssertUnwindSafe(async move {
             let _permit = permit;
             policy.classify(request).await
-        }));
+        })
+        .catch_unwind();
+        tokio::pin!(classify);
         if let Some(deadline) = deadline {
             tokio::select! {
                 result = &mut classify => {
-                    map_policy_task_result("classify", result)
+                    map_policy_future_result("classify", result)
                 }
                 _ = self.shutdown.cancelled() => Err(KvSchedulerError::SubscriberShutdown),
                 _ = tokio::time::sleep_until(deadline.into()) => Err(KvSchedulerError::DeadlineExceeded),
@@ -363,7 +366,7 @@ impl FlowControlRuntime {
         } else {
             tokio::select! {
                 result = &mut classify => {
-                    map_policy_task_result("classify", result)
+                    map_policy_future_result("classify", result)
                 }
                 _ = self.shutdown.cancelled() => Err(KvSchedulerError::SubscriberShutdown),
             }
@@ -424,16 +427,27 @@ impl FlowControlRuntime {
     }
 }
 
-fn map_policy_task_result<T>(
+fn map_policy_future_result<T>(
     operation: &str,
-    result: Result<Result<T, FlowControlPolicyError>, tokio::task::JoinError>,
+    result: Result<Result<T, FlowControlPolicyError>, Box<dyn std::any::Any + Send + 'static>>,
 ) -> Result<T, KvSchedulerError> {
     match result {
         Ok(result) => result.map_err(KvSchedulerError::FlowControlPolicy),
-        Err(error) => Err(KvSchedulerError::FlowControlPolicy(
-            FlowControlPolicyError::new(format!("{operation} task failed: {error}")),
+        Err(payload) => Err(KvSchedulerError::FlowControlPolicy(
+            FlowControlPolicyError::new(format!(
+                "{operation} panicked: {}",
+                panic_message(payload.as_ref())
+            )),
         )),
     }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -467,34 +481,27 @@ async fn run_event_pump(
             }
         };
         let event_kind = event.kind();
-        let event_policy = Arc::clone(&policy);
-        let mut event_task =
-            AbortOnDropHandle::new(tokio::spawn(
-                async move { event_policy.on_event(event).await },
-            ));
+        let event_delivery = AssertUnwindSafe(policy.on_event(event)).catch_unwind();
+        tokio::pin!(event_delivery);
         let event_sleep = tokio::time::sleep(event_timeout);
         tokio::pin!(event_sleep);
         let result = tokio::select! {
             biased;
-            _ = shutdown.cancelled() => {
-                event_task.abort();
-                let _ = event_task.await;
-                break;
-            },
-            result = &mut event_task => Some(result),
-            _ = &mut event_sleep => {
-                event_task.abort();
-                let _ = event_task.await;
-                None
-            },
+            _ = shutdown.cancelled() => break,
+            result = &mut event_delivery => Some(result),
+            _ = &mut event_sleep => None,
         };
         match result {
             Some(Ok(Ok(()))) => {}
             Some(Ok(Err(error))) => {
                 log_event_failure(&mut event_failure_warned, event_kind, &error.to_string());
             }
-            Some(Err(error)) => {
-                log_event_failure(&mut event_failure_warned, event_kind, &error.to_string());
+            Some(Err(payload)) => {
+                log_event_failure(
+                    &mut event_failure_warned,
+                    event_kind,
+                    panic_message(payload.as_ref()),
+                );
             }
             None => {
                 log_event_failure(&mut event_failure_warned, event_kind, "timeout");
@@ -504,11 +511,13 @@ async fn run_event_pump(
 
     pending_classifications.close();
     wait_for_classifications(&active_classifications, &classifications_idle).await;
-    let mut teardown = AbortOnDropHandle::new(tokio::spawn(async move { policy.teardown().await }));
-    match (&mut teardown).await {
+    match AssertUnwindSafe(policy.teardown()).catch_unwind().await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(%error, "Flow-control policy teardown failed"),
-        Err(error) => tracing::warn!(%error, "Flow-control policy teardown task failed"),
+        Err(payload) => tracing::warn!(
+            reason = panic_message(payload.as_ref()),
+            "Flow-control policy teardown panicked"
+        ),
     }
 }
 
