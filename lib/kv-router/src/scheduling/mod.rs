@@ -3,6 +3,7 @@
 
 pub mod config;
 mod filter;
+pub mod flow_control;
 mod local;
 pub mod overlap;
 pub mod overlap_refresh;
@@ -18,6 +19,9 @@ mod worker_selection_config;
 
 mod types;
 pub use filter::*;
+pub use flow_control::{
+    Classification, ClassifyRequest, FlowControlEvent, FlowControlPolicy, FlowControlPolicyError,
+};
 pub use local::LocalScheduler;
 pub use overlap::{
     CacheHitEstimates, OverlapAnalysis, OverlapScoresResponse, OverlapSignals,
