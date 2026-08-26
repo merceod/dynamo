@@ -419,8 +419,8 @@ impl FlowControlRuntime {
         }
     }
 
-    pub(crate) fn begin_request(&self, request_id: &str) {
-        self.live_requests.lock().insert(request_id.to_owned());
+    pub(crate) fn begin_request(&self, request_id: &str) -> bool {
+        self.live_requests.lock().insert(request_id.to_owned())
     }
 
     pub(crate) fn finish_request(&self, event: FlowControlEvent) {
@@ -741,8 +741,8 @@ mod tests {
             .await
             .unwrap();
 
-        runtime.begin_request("live");
-        runtime.begin_request("mailbox-full");
+        assert!(runtime.begin_request("live"));
+        assert!(runtime.begin_request("mailbox-full"));
         runtime.finish_request(FlowControlEvent::Completed {
             request_id: "first".to_string(),
             context_tokens: None,

@@ -51,16 +51,20 @@ impl FlowControlRequestGuard {
         flow_control: Arc<FlowControlRuntime>,
         request_id: Option<String>,
         tracked: bool,
-    ) -> Self {
-        if let Some(request_id) = request_id.as_deref() {
-            flow_control.begin_request(request_id);
+    ) -> Result<Self, KvSchedulerError> {
+        if let Some(request_id) = request_id.as_deref()
+            && !flow_control.begin_request(request_id)
+        {
+            return Err(KvSchedulerError::BookingFailed(format!(
+                "request {request_id:?} is already live"
+            )));
         }
-        Self {
+        Ok(Self {
             flow_control,
             request_id,
             tracked,
             released: false,
-        }
+        })
     }
 
     fn selected(&mut self, worker: WorkerWithDpRank) {
@@ -461,9 +465,13 @@ where
         let ingress_at = StdInstant::now();
         let request_id = request.mode.request_id().map(str::to_owned);
         let tracked = request.mode.is_tracked();
-        let mut flow_control_guard = self.flow_control.as_ref().map(|flow_control| {
-            FlowControlRequestGuard::new(Arc::clone(flow_control), request_id, tracked)
-        });
+        let mut flow_control_guard = self
+            .flow_control
+            .as_ref()
+            .map(|flow_control| {
+                FlowControlRequestGuard::new(Arc::clone(flow_control), request_id, tracked)
+            })
+            .transpose()?;
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let lifecycle_lease = self
             .queue
@@ -1263,6 +1271,51 @@ mod tests {
             Some(FlowControlEvent::Dispatched { request_id, worker })
                 if request_id == "classified" && worker.worker_id == 0
         ));
+        scheduler.free("classified").await.unwrap();
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(FlowControlEvent::Completed { request_id, .. })
+                if request_id == "classified"
+        ));
+        cancel.cancel();
+        scheduler.wait_for_flow_control_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_live_request_id_does_not_release_original_flow_control_state() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (scheduler, cancel) =
+            make_flow_control_scheduler(FlowControlConfig::new(InspectingFlowControl {
+                calls: Arc::clone(&calls),
+                events: event_tx,
+            }))
+            .await;
+
+        scheduler
+            .schedule_request(request(ScheduleMode::Tracked {
+                request_id: "classified".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(FlowControlEvent::Dispatched { request_id, .. })
+                if request_id == "classified"
+        ));
+
+        let duplicate = scheduler
+            .schedule_request(request(ScheduleMode::Tracked {
+                request_id: "classified".to_string(),
+            }))
+            .await;
+        assert!(matches!(
+            duplicate,
+            Err(KvSchedulerError::BookingFailed(message))
+                if message.contains("already live")
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
         scheduler.free("classified").await.unwrap();
         assert!(matches!(
             event_rx.recv().await,
