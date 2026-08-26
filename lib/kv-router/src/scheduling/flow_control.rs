@@ -435,12 +435,6 @@ impl FlowControlRuntime {
         self.emit(event);
     }
 
-    pub(crate) fn reconcile(&self) {
-        if !self.shutdown.is_cancelled() {
-            self.request_reconcile();
-        }
-    }
-
     fn request_reconcile(&self) {
         request_reconcile(
             self.reconcile_pending.as_ref(),
@@ -881,7 +875,7 @@ mod tests {
         )
         .await
         .unwrap();
-        runtime.reconcile();
+        runtime.request_reconcile();
         runtime.emit(FlowControlEvent::Completed {
             request_id: "after-timeout".to_string(),
         });

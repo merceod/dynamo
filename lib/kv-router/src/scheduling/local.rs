@@ -390,7 +390,7 @@ where
                         queue_config_updates.update().await;
                         let _ = queue_updates_config.send(());
                         if let Some(flow_control) = flow_control_config_updates.as_ref() {
-                            flow_control.reconcile();
+                            flow_control.emit(FlowControlEvent::WorkerLoadChanged { worker: None });
                         }
                     }
                 }
@@ -667,7 +667,7 @@ where
     pub fn register_workers(&self, worker_ids: &HashSet<WorkerId>) {
         self.queue.register_workers(worker_ids);
         if let Some(flow_control) = self.flow_control.as_ref() {
-            flow_control.reconcile();
+            flow_control.emit(FlowControlEvent::WorkerLoadChanged { worker: None });
         }
     }
 
