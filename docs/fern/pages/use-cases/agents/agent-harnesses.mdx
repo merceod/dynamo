@@ -8,14 +8,18 @@ subtitle: Point coding-agent CLIs at a Dynamo deployment
 Dynamo exposes `v1/chat/completions`, `v1/responses`, and `v1/messages`, so any agent that uses these APIs can talk to a Dynamo endpoint even if it is not listed in this guide. This guide focuses on popular agent harnesses that send stable session IDs. Dynamo normalizes these IDs for tracing and other explicitly configured consumers.
 
 <Steps toc={true}>
-<Step title="Start a local agent endpoint" id="local-setup">
-To locally test these out, we have a small script that runs an SGLang-backed `zai-org/GLM-4.7-Flash` endpoint. This script starts a TP2 instance on port 8000 and enables request tracing for replay and visualization. By default traces are saved in `/tmp/dynamo-request-trace-$(date +%Y%m%d-%H%M%S)`
+<Step title="Deploy a Dynamo recipe" id="deploy-recipe">
+Install the [Dynamo Kubernetes Platform](../../kubernetes/getting-started/quickstart.mdx), then choose a supported model and topology from the [Dynamo recipe catalog](https://github.com/ai-dynamo/dynamo/tree/main/recipes). Follow that recipe through model preparation, `DynamoGraphDeployment` readiness, and frontend exposure. This guide does not create a second backend or assume a service name.
 
-To start it, run:
+When the recipe is ready, retain its frontend URL and exact served model as the inputs to every harness command:
 
 ```bash
-bash examples/backends/sglang/launch/agg_agent.sh
+export DYNAMO_BASE_URL=http://127.0.0.1:8000
+export DYNAMO_MODEL=your-recipe-served-model
+curl -fsS "$DYNAMO_BASE_URL/v1/models" | jq -e --arg model "$DYNAMO_MODEL" '.data[]? | select(.id == $model)'
 ```
+
+The examples below assume that Kubernetes deployment remains running and reachable at `DYNAMO_BASE_URL`. Export `DYNAMO_API_KEY` too when the deployed endpoint requires authentication.
 
 </Step>
 <Step title="Configure a harness" id="configure-a-harness">
@@ -37,6 +41,33 @@ bash examples/backends/sglang/launch/agg_agent.sh
     ```
 
     Dynamo maps Codex's `thread-id` header to `session_id`. A spawned child thread also sends `x-codex-parent-thread-id`, which Dynamo maps to `parent_session_id`.
+
+  </Tab>
+  <Tab title="DeepSeek Harness">
+
+    DeepSeek Harness (DSH) uses Chat Completions. Install the pinned published-package client and run its persistent ACP host. It keeps one JSON-RPC stdio connection, creates one fresh session, and submits each `--prompt` sequentially to that session:
+
+    ```bash
+    export DSH_WORKSPACE=$PWD
+    export DYNAMO_CONTEXT_WINDOW=your-recipe-context-window
+    corepack pnpm@11.7.0 --dir examples/agent_harnesses/deepseek_harness/client install --prod --frozen-lockfile --ignore-scripts
+    corepack pnpm@11.7.0 --dir examples/agent_harnesses/deepseek_harness/client exec node drive_deepseek_harness_acp.mjs \
+      --base-url "$DYNAMO_BASE_URL" \
+      --model "$DYNAMO_MODEL" \
+      --context-window "$DYNAMO_CONTEXT_WINDOW" \
+      --cwd "$DSH_WORKSPACE" \
+      --prompt 'Inspect one relevant file and report a verified fact.' \
+      --prompt 'Recheck that fact against another relevant file.' \
+      --capture "$DSH_WORKSPACE/dsh-acp-request-trace.jsonl"
+    ```
+
+    Pass the context capacity exposed by the deployed recipe with `--context-window`. The client creates an isolated DSH profile, passes a minimal environment, and writes a redacted local trace with exclusive creation. It reads `DYNAMO_API_KEY` only and ignores an ambient `DEEPSEEK_API_KEY`.
+
+    Dynamo maps DSH's `x-deepseek-harness-session-id` to `session_id` and exact `x-deepseek-harness-compact: 1` to compaction metadata when DSH identity wins header precedence. This path pins the published `@deepseek-ai/dsh-acp` server plugin and the published `@deepseek-ai/dsh-acp-demo` executable app composition that embeds it. Dynamo owns only the ACP client, isolated deployment composition, relay, and bounded EOF launcher. It does not patch DSH or depend on a DSH checkout. The session is connection-owned: `session/load`, per-session close, and resume after disconnect are unsupported in DSH ACP `0.1.0-rc.8`.
+
+    Add `--canonicalize-dynamo-headers` only for a server that predates native DSH normalization. The relay preserves native headers and duplicates session identity into the canonical Dynamo header; the option does not backport compaction normalization.
+
+    Add `--session-final` only when the target is the native ThunderAgent frontend. The relay waits for DSH to flush, then sends `x-dynamo-session-final: true` after normal or interrupted shutdown. It fails when no session reached Dynamo or cleanup is rejected, and returns `130` for SIGINT or `143` for SIGTERM. Stock KV has no program lifecycle to close, so leave the option off there.
 
   </Tab>
   <Tab title="Pi">
@@ -201,7 +232,7 @@ bash examples/backends/sglang/launch/agg_agent.sh
 
 ## Drive a Harness from Another Agent
 
-Use the repository's `.agents/skills/dynamo-agent-harness` skill when an agent needs to keep a Claude Code, Codex, or OpenCode session open across multiple prompts while Dynamo serves the model. The skill uses Agent Client Protocol (ACP) and injects the provider configuration through the child process environment instead of adding harness configuration files to the delegated worktree.
+Use the repository's `.agents/skills/dynamo-agent-harness` skill when an agent needs to keep a Claude Code, Codex, OpenCode, or DSH session open across multiple prompts while Dynamo serves the model. The drivers use Agent Client Protocol (ACP). The DSH path retains its native Chat Completions transport through a loopback capture relay and owns one fresh session until its stdio connection closes; it cannot resume that session afterward.
 
 The skill pins the Claude Code and Codex ACP adapters. If a harness release changes the model, endpoint, session header, authentication, or mode configuration, update this page and the skill in the same change after running a persistent two-turn tool smoke test.
 
@@ -212,6 +243,7 @@ An agent harness can compact older conversation history into a summary when its 
 | Harness | Signal recognized by Dynamo | Normalized agent context |
 | --- | --- | --- |
 | Codex | `x-codex-turn-metadata` with `request_kind` set to `compaction` | `agent_context.compaction` |
+| DeepSeek Harness | Exact `x-deepseek-harness-compact: 1` on the selected DSH identity mapping | `agent_context.compaction` |
 | Claude Code | No supported mapping | Unset |
 | OpenCode | No supported mapping | Unset |
 
