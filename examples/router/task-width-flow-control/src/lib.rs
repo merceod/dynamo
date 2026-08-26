@@ -206,7 +206,6 @@ mod tests {
         policy
             .on_event(FlowControlEvent::Completed {
                 request_id: "request-1".to_owned(),
-                context_tokens: None,
             })
             .await
             .unwrap();
@@ -240,7 +239,6 @@ mod tests {
         policy
             .on_event(FlowControlEvent::Completed {
                 request_id: "request-1".to_owned(),
-                context_tokens: None,
             })
             .await
             .unwrap();
@@ -268,7 +266,6 @@ mod tests {
         policy
             .on_event(FlowControlEvent::Completed {
                 request_id: winner.to_owned(),
-                context_tokens: None,
             })
             .await
             .unwrap();
