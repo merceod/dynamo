@@ -63,6 +63,7 @@ impl PolicyClassConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyProfile {
     classes: Vec<PolicyClassConfig>,
+    class_indices: HashMap<String, usize>,
     classifier: PolicyClassifier,
 }
 
@@ -125,6 +126,7 @@ impl PolicyProfile {
             cached_token_queue_limit_per_worker: None,
         };
         Self {
+            class_indices: HashMap::from([(class.name.clone(), 0)]),
             classes: vec![class],
             classifier: PolicyClassifier::SyntheticSingle { class_index: 0 },
         }
@@ -162,7 +164,7 @@ impl PolicyProfile {
     }
 
     pub(crate) fn class_index_by_name(&self, name: &str) -> Option<usize> {
-        self.classes.iter().position(|class| class.name == name)
+        self.class_indices.get(name).copied()
     }
 }
 
@@ -430,8 +432,14 @@ fn resolve_profile(
         }
     }
 
+    let class_indices = classes
+        .iter()
+        .enumerate()
+        .map(|(index, class)| (class.name.clone(), index))
+        .collect();
     Ok(PolicyProfile {
         classes,
+        class_indices,
         classifier: PolicyClassifier::FamilyBucket(FamilyBucketClassifier {
             default_family_index,
             family_indices,
