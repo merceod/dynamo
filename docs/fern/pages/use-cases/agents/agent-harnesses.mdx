@@ -8,14 +8,18 @@ subtitle: Point coding-agent CLIs at a Dynamo deployment
 Dynamo exposes `v1/chat/completions`, `v1/responses`, and `v1/messages`, so any agent that uses these APIs can talk to a Dynamo endpoint even if it is not listed in this guide. This guide focuses on popular agent harnesses that send stable session IDs. Dynamo normalizes these IDs for tracing and other explicitly configured consumers.
 
 <Steps toc={true}>
-<Step title="Start a local agent endpoint" id="local-setup">
-To locally test these out, we have a small script that runs an SGLang-backed `zai-org/GLM-4.7-Flash` endpoint. This script starts a TP2 instance on port 8000 and enables request tracing for replay and visualization. By default traces are saved in `/tmp/dynamo-request-trace-$(date +%Y%m%d-%H%M%S)`
+<Step title="Deploy a Dynamo recipe" id="deploy-recipe">
+Install the [Dynamo Kubernetes Platform](../../kubernetes/getting-started/quickstart.mdx), then choose a supported model and topology from the [Dynamo recipe catalog](https://github.com/ai-dynamo/dynamo/tree/main/recipes). Follow that recipe through model preparation, `DynamoGraphDeployment` readiness, and frontend exposure. This guide does not create a second backend or assume a service name.
 
-To start it, run:
+When the recipe is ready, retain its frontend URL and exact served model as the inputs to every harness command:
 
 ```bash
-bash examples/backends/sglang/launch/agg_agent.sh
+export DYNAMO_BASE_URL=http://127.0.0.1:8000
+export DYNAMO_MODEL=your-recipe-served-model
+curl -fsS "$DYNAMO_BASE_URL/v1/models" | jq -e --arg model "$DYNAMO_MODEL" '.data[]? | select(.id == $model)'
 ```
+
+The examples below assume that Kubernetes deployment remains running and reachable at `DYNAMO_BASE_URL`. Export `DYNAMO_API_KEY` too when the deployed endpoint requires authentication.
 
 </Step>
 <Step title="Configure a harness" id="configure-a-harness">
@@ -37,6 +41,43 @@ bash examples/backends/sglang/launch/agg_agent.sh
     ```
 
     Dynamo maps Codex's `thread-id` header to `session_id`. A spawned child thread also sends `x-codex-parent-thread-id`, which Dynamo maps to `parent_session_id`.
+
+  </Tab>
+  <Tab title="Omnigent">
+
+    Omnigent is an open-source meta-harness that can run Codex against an OpenAI-compatible gateway. Install a supported Omnigent release, then use `omnigent setup` to add a Gateway credential for Codex. Set its base URL to the Dynamo recipe endpoint with `/v1` appended and use the recipe's API key, or any nonempty value for an unauthenticated local endpoint.
+
+    ```bash
+    uv tool install --python 3.12 omnigent
+    omnigent setup
+    ```
+
+    Create an agent file with an explicit platform sandbox:
+
+    ```yaml
+    name: dynamo-codex
+    prompt: Use tools to verify claims before answering.
+    executor:
+      harness: codex
+      model: your-recipe-served-model
+    os_env:
+      type: caller_process
+      cwd: /absolute/worktree
+      sandbox:
+        type: auto
+    ```
+
+    Replace the model and workspace values, then run one bounded task:
+
+    ```bash
+    omnigent run ./dynamo-codex.yaml \
+      --server local \
+      --harness codex \
+      --model "$DYNAMO_MODEL" \
+      -p 'Inspect one file and report one verified fact. Do not modify files.'
+    ```
+
+    Codex sends streaming `/v1/responses` requests with `thread-id`, which Dynamo normalizes as the session ID. Treat this as a stock-Dynamo compatibility path: Omnigent does not currently send the ThunderAgent terminal lifecycle header, and a one-command run does not prove persistent main-thread reuse. Run it in a dedicated environment if cleanup requires `omnigent stop`, because that command stops all local Omnigent processes. See the [Omnigent well-lit path](https://github.com/ai-dynamo/dynamo/blob/main/examples/agent_harnesses/omnigent/README.md) for verification and cleanup boundaries.
 
   </Tab>
   <Tab title="Pi">
@@ -201,7 +242,7 @@ bash examples/backends/sglang/launch/agg_agent.sh
 
 ## Drive a Harness from Another Agent
 
-Use the repository's `.agents/skills/dynamo-agent-harness` skill when an agent needs to keep a Claude Code, Codex, or OpenCode session open across multiple prompts while Dynamo serves the model. The skill uses Agent Client Protocol (ACP) and injects the provider configuration through the child process environment instead of adding harness configuration files to the delegated worktree.
+Use the repository's `.agents/skills/dynamo-agent-harness` skill when an agent needs to keep a Claude Code, Codex, or OpenCode session open across multiple prompts while Dynamo serves the model. Those persistent paths use Agent Client Protocol (ACP) and inject provider configuration through the child process environment instead of adding harness configuration files to the delegated worktree. Omnigent uses its own public gateway and agent-file interfaces; the bounded command above does not claim a persistent multi-prompt session.
 
 The skill pins the Claude Code and Codex ACP adapters. If a harness release changes the model, endpoint, session header, authentication, or mode configuration, update this page and the skill in the same change after running a persistent two-turn tool smoke test.
 
