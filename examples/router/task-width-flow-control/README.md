@@ -11,6 +11,8 @@ This standalone crate demonstrates Dynamo's experimental `FlowControlPolicy` int
 
 Dynamo continues to own request ordering, worker eligibility, placement, reservations, and accounting. This policy controls only when a request enters the router's ordering stage.
 
+For the capacity-only ThunderAgent reduction, `classify` remains the default pass-through hook because Order already waits for downstream capacity. llm-d sticky routing remains a Place-only policy and does not require a custom Classify hook. The task-width policy in this crate demonstrates the TAPER-style case that does require Classify deferral.
+
 ## Use the Policy
 
 Construct the policy and pass its configuration to `KvScheduler::start_with_flow_control` in the process that owns the router:
