@@ -77,10 +77,7 @@ impl FlowControlRequestGuard {
                 .emit(FlowControlEvent::Dispatched { request_id, worker });
         } else {
             self.flow_control
-                .finish_request(FlowControlEvent::Completed {
-                    request_id,
-                    context_tokens: None,
-                });
+                .finish_request(FlowControlEvent::Completed { request_id });
         }
         self.released = true;
     }
@@ -722,10 +719,7 @@ where
                 None => self.queue.update().await,
             }
             if let Some(flow_control) = self.flow_control.as_ref() {
-                flow_control.finish_request(FlowControlEvent::Completed {
-                    request_id,
-                    context_tokens: None,
-                });
+                flow_control.finish_request(FlowControlEvent::Completed { request_id });
             }
         }
         Ok(())
@@ -747,10 +741,7 @@ where
         if outcome.is_applied() {
             self.queue.update_worker(worker).await;
             if let Some(flow_control) = self.flow_control.as_ref() {
-                flow_control.finish_request(FlowControlEvent::Completed {
-                    request_id,
-                    context_tokens: None,
-                });
+                flow_control.finish_request(FlowControlEvent::Completed { request_id });
             }
         }
         Ok(())

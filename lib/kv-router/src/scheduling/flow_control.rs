@@ -161,7 +161,6 @@ pub enum FlowControlEvent {
     },
     Completed {
         request_id: String,
-        context_tokens: Option<usize>,
     },
     Aborted {
         request_id: String,
@@ -758,13 +757,11 @@ mod tests {
         assert!(runtime.begin_request("mailbox-full"));
         runtime.finish_request(FlowControlEvent::Completed {
             request_id: "first".to_string(),
-            context_tokens: None,
         });
         entered.notified().await;
         assert_eq!(event_rx.recv().await, Some("completed"));
         runtime.emit(FlowControlEvent::Completed {
             request_id: "second".to_string(),
-            context_tokens: None,
         });
         runtime.finish_request(FlowControlEvent::Aborted {
             request_id: "mailbox-full".to_string(),
@@ -887,7 +884,6 @@ mod tests {
         runtime.reconcile();
         runtime.emit(FlowControlEvent::Completed {
             request_id: "after-timeout".to_string(),
-            context_tokens: None,
         });
 
         tokio::time::timeout(Duration::from_millis(250), completed_rx.recv())
@@ -932,7 +928,6 @@ mod tests {
 
         runtime.finish_request(FlowControlEvent::Completed {
             request_id: "completed".to_string(),
-            context_tokens: None,
         });
 
         let live_request_ids =
