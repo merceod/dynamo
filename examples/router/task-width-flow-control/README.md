@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 This standalone crate demonstrates Dynamo's experimental `FlowControlPolicy` interface. It treats the session ID in each request as a task key and allows a fixed number of requests from that task to remain active at once.
 
-`classify` stays pending when a task has reached its width. A `Completed` or `Aborted` lifecycle event releases capacity and wakes pending classifiers. Requests without both a request ID and session metadata pass through without creating policy state.
+`classify` stays pending when a task has reached its width. A `Completed` or `Aborted` lifecycle event releases capacity and wakes pending classifiers. If the bounded event mailbox coalesces events, `Reconcile` supplies the router's live-request snapshot so the policy can remove stale reservations. Requests without both a request ID and session metadata pass through without creating policy state.
 
 Dynamo continues to own request ordering, worker eligibility, placement, reservations, and accounting. This policy controls only when a request enters the router's ordering stage.
 

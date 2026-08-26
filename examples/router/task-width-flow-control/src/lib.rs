@@ -6,7 +6,7 @@
 //! The example treats a request's session ID as its task key. Requests without
 //! both a request ID and session metadata pass through without policy state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, MutexGuard};
 
@@ -48,7 +48,14 @@ impl TaskWidthPolicy {
 
     fn release(&self, request_id: &str) -> Result<bool, FlowControlPolicyError> {
         let mut state = self.lock_state()?;
-        let Some(task_id) = state.task_by_request.remove(request_id) else {
+        Self::release_from_state(&mut state, request_id)
+    }
+
+    fn release_from_state(
+        state: &mut State,
+        request_id: &str,
+    ) -> Result<bool, FlowControlPolicyError> {
+        let Some(task_id) = state.task_by_request.get(request_id).cloned() else {
             return Ok(false);
         };
         let Some(active) = state.active_by_task.get_mut(&task_id) else {
@@ -64,7 +71,27 @@ impl TaskWidthPolicy {
         if *active == 0 {
             state.active_by_task.remove(&task_id);
         }
+        state.task_by_request.remove(request_id);
         Ok(true)
+    }
+
+    fn reconcile(&self, live_request_ids: &[String]) -> Result<bool, FlowControlPolicyError> {
+        let live_request_ids = live_request_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut state = self.lock_state()?;
+        let stale_request_ids = state
+            .task_by_request
+            .keys()
+            .filter(|request_id| !live_request_ids.contains(request_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut released = false;
+        for request_id in stale_request_ids {
+            released |= Self::release_from_state(&mut state, &request_id)?;
+        }
+        Ok(released)
     }
 
     fn notify_state_changed(&self) {
@@ -118,6 +145,9 @@ impl FlowControlPolicy for TaskWidthPolicy {
         let released = match event {
             FlowControlEvent::Completed { request_id, .. }
             | FlowControlEvent::Aborted { request_id } => self.release(&request_id)?,
+            FlowControlEvent::Reconcile { live_request_ids } => {
+                self.reconcile(&live_request_ids)?
+            }
             _ => false,
         };
         if released {
@@ -180,6 +210,96 @@ mod tests {
             })
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_millis(100), &mut second)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_releases_only_one_of_multiple_waiters() {
+        let policy = Arc::new(TaskWidthPolicy::new(NonZeroUsize::MIN));
+        policy
+            .classify(request("request-1", "task-1"))
+            .await
+            .unwrap();
+        let second = policy.classify(request("request-2", "task-1"));
+        let third = policy.classify(request("request-3", "task-1"));
+        tokio::pin!(second, third);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut second)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut third)
+                .await
+                .is_err()
+        );
+
+        policy
+            .on_event(FlowControlEvent::Completed {
+                request_id: "request-1".to_owned(),
+                context_tokens: None,
+            })
+            .await
+            .unwrap();
+        let second_won = tokio::select! {
+            result = &mut second => {
+                result.unwrap();
+                true
+            }
+            result = &mut third => {
+                result.unwrap();
+                false
+            }
+        };
+
+        let (winner, remaining) = if second_won {
+            ("request-2", &mut third)
+        } else {
+            ("request-3", &mut second)
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut *remaining)
+                .await
+                .is_err()
+        );
+        policy
+            .on_event(FlowControlEvent::Completed {
+                request_id: winner.to_owned(),
+                context_tokens: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(100), remaining)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_cleans_state_for_requests_no_longer_owned_by_router() {
+        let policy = Arc::new(TaskWidthPolicy::new(NonZeroUsize::MIN));
+        policy
+            .classify(request("request-1", "task-1"))
+            .await
+            .unwrap();
+        let second = policy.classify(request("request-2", "task-1"));
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut second)
+                .await
+                .is_err()
+        );
+
+        policy
+            .on_event(FlowControlEvent::Reconcile {
+                live_request_ids: Arc::from([]),
+            })
+            .await
+            .unwrap();
+
         tokio::time::timeout(Duration::from_millis(100), &mut second)
             .await
             .unwrap()
