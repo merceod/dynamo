@@ -78,6 +78,7 @@ COPY --from=dynamo Cargo.toml Cargo.lock README.md ./
 # Copy all local workspace crates. AISimulate resolves from crates.io.
 COPY --from=dynamo lib/ lib/
 COPY --from=dynamo examples/router/custom-policy-example/ examples/router/custom-policy-example/
+COPY --from=dynamo examples/router/task-width-flow-control/ examples/router/task-width-flow-control/
 
 # ext-proc is also a workspace member (referenced from the root Cargo.toml),
 # so cargo needs its manifest on disk to resolve the workspace even when we
