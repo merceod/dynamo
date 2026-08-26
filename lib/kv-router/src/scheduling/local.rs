@@ -1031,6 +1031,11 @@ mod tests {
         events: mpsc::UnboundedSender<FlowControlEvent>,
     }
 
+    struct PauseResumeFlowControl {
+        entered: Arc<Notify>,
+        released: Arc<Notify>,
+    }
+
     #[async_trait]
     impl FlowControlPolicy for PendingFlowControl {
         async fn classify(
@@ -1044,6 +1049,18 @@ mod tests {
         async fn on_event(&self, event: FlowControlEvent) -> Result<(), FlowControlPolicyError> {
             self.events.send(event).unwrap();
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl FlowControlPolicy for PauseResumeFlowControl {
+        async fn classify(
+            &self,
+            _request: ClassifyRequest,
+        ) -> Result<Classification, FlowControlPolicyError> {
+            self.entered.notify_one();
+            self.released.notified().await;
+            Ok(Classification::default())
         }
     }
 
@@ -1268,6 +1285,46 @@ mod tests {
             Some(FlowControlEvent::Completed { request_id, .. })
                 if request_id == "classified"
         ));
+        cancel.cancel();
+        scheduler.wait_for_flow_control_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn paused_classifier_resumes_into_order_and_place() {
+        let entered = Arc::new(Notify::new());
+        let released = Arc::new(Notify::new());
+        let (scheduler, cancel) =
+            make_flow_control_scheduler(FlowControlConfig::new(PauseResumeFlowControl {
+                entered: Arc::clone(&entered),
+                released: Arc::clone(&released),
+            }))
+            .await;
+        let request_scheduler = Arc::clone(&scheduler);
+        let mut schedule = tokio::spawn(async move {
+            request_scheduler
+                .schedule_request(request(ScheduleMode::Tracked {
+                    request_id: "paused".to_string(),
+                }))
+                .await
+        });
+        entered.notified().await;
+
+        assert_eq!(scheduler.pending_classification_count(), 1);
+        assert_eq!(scheduler.pending_count(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut schedule)
+                .await
+                .is_err()
+        );
+
+        released.notify_one();
+        let response = tokio::time::timeout(Duration::from_millis(250), &mut schedule)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.best_worker.worker_id, 0);
+        scheduler.free("paused").await.unwrap();
         cancel.cancel();
         scheduler.wait_for_flow_control_shutdown().await;
     }
