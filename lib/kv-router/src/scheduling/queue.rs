@@ -2798,7 +2798,7 @@ policy_classes:
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn class_local_limit_rejection_is_typed_and_not_overload() {
+    async fn class_local_limit_rejection_is_typed_overload() {
         let profile = policy_profile(
             r#"
 default_policy_family: capped
@@ -2833,7 +2833,7 @@ policy_classes:
         assert_eq!(rejection.limit_kind, super::super::QueueLimitKind::Requests);
         assert_eq!(rejection.current, 1);
         assert_eq!(rejection.limit, 1);
-        assert!(!error.is_overload());
+        assert!(error.is_overload());
 
         assert_eq!(
             queue.class_queue_stats(0),

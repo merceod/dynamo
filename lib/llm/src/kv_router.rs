@@ -434,10 +434,9 @@ pub const RADIX_STATE_FILE: &str = "radix-state";
 pub const WORKER_KV_INDEXER_BUFFER_SIZE: usize = 1024; // store 1024 most recent events in worker buffer
 
 fn map_scheduler_error(error: scheduling::KvSchedulerError) -> anyhow::Error {
-    // Keep the two overload cases apart. A single overloaded worker can be
-    // retried elsewhere; a pool with no free worker cannot, and migrating it
-    // would just bounce the request around. A filter rejection is unavailable,
-    // not overload, and becomes HTTP 503.
+    // A single overloaded worker can be retried elsewhere; pool-wide and
+    // flow-control overloads cannot. A filter rejection is unavailable, not
+    // overload, and becomes HTTP 503.
     let (error_type, overloaded) = match error {
         scheduling::KvSchedulerError::PinnedWorkerOverloaded { .. } => {
             (ErrorType::WorkerOverloaded, true)
@@ -445,6 +444,8 @@ fn map_scheduler_error(error: scheduling::KvSchedulerError) -> anyhow::Error {
         scheduling::KvSchedulerError::AllEligibleWorkersOverloaded => {
             (ErrorType::ResourceExhausted, true)
         }
+        scheduling::KvSchedulerError::FlowControlPendingLimit { .. }
+        | scheduling::KvSchedulerError::DeadlineExceeded => (ErrorType::ResourceExhausted, true),
         scheduling::KvSchedulerError::AllEligibleWorkersFiltered => (ErrorType::Unavailable, false),
         _ => return error.into(),
     };
@@ -2033,6 +2034,21 @@ mod tests {
             .expect("filtered workers should produce a DynamoError");
 
         assert_eq!(dynamo_error.error_type(), ErrorType::Unavailable);
+    }
+
+    #[test]
+    fn flow_control_rejections_map_to_resource_exhausted() {
+        for error in [
+            KvSchedulerError::FlowControlPendingLimit { limit: 8 },
+            KvSchedulerError::DeadlineExceeded,
+        ] {
+            let error = map_scheduler_error(error);
+            let dynamo_error = error
+                .downcast_ref::<DynamoError>()
+                .expect("flow-control rejection should produce a DynamoError");
+
+            assert_eq!(dynamo_error.error_type(), ErrorType::ResourceExhausted);
+        }
     }
 
     #[test]

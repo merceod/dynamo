@@ -115,7 +115,9 @@ impl KvSchedulerError {
             self,
             Self::AllEligibleWorkersOverloaded
                 | Self::PinnedWorkerOverloaded { .. }
+                | Self::QueueRejected(_)
                 | Self::FlowControlPendingLimit { .. }
+                | Self::DeadlineExceeded
         )
     }
 }
