@@ -8,12 +8,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use dynamo_kv_router::scheduling::{
     Classification, ClassifyRequest, FlowControlEvent, FlowControlPolicy, FlowControlPolicyError,
 };
+use parking_lot::Mutex;
 use tokio::sync::watch;
 
 /// Limits the number of classified, non-terminal requests for each task.
@@ -40,14 +40,8 @@ impl TaskWidthPolicy {
         }
     }
 
-    fn lock_state(&self) -> Result<MutexGuard<'_, State>, FlowControlPolicyError> {
-        self.state
-            .lock()
-            .map_err(|_| FlowControlPolicyError::new("task-width policy state lock was poisoned"))
-    }
-
     fn release(&self, request_id: &str) -> Result<bool, FlowControlPolicyError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.state.lock();
         Self::release_from_state(&mut state, request_id)
     }
 
@@ -80,7 +74,7 @@ impl TaskWidthPolicy {
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let mut state = self.lock_state()?;
+        let mut state = self.state.lock();
         let stale_request_ids = state
             .task_by_request
             .keys()
@@ -117,7 +111,7 @@ impl FlowControlPolicy for TaskWidthPolicy {
 
         loop {
             {
-                let mut state = self.lock_state()?;
+                let mut state = self.state.lock();
                 if let Some(existing_task_id) = state.task_by_request.get(&request_id) {
                     if existing_task_id == &task_id {
                         return Ok(Classification::default());
@@ -157,7 +151,7 @@ impl FlowControlPolicy for TaskWidthPolicy {
     }
 
     async fn teardown(&self) -> Result<(), FlowControlPolicyError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.state.lock();
         state.active_by_task.clear();
         state.task_by_request.clear();
         drop(state);
@@ -171,7 +165,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use dynamo_kv_router::scheduling::SessionContext;
+    use dynamo_kv_router::protocols::RoutingConstraints;
+    use dynamo_kv_router::scheduling::{
+        FlowControlConfig, LocalScheduler, OverlapSignals, PolicyProfile, ScheduleMode,
+        ScheduleRequest, SessionContext,
+    };
+    use dynamo_kv_router::{
+        ActiveSequencesMultiWorker, DefaultWorkerSelector, NoopSequencePublisher,
+        RouterQueuePolicy, WorkerConfigLike,
+    };
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
@@ -185,6 +188,132 @@ mod tests {
                 None,
                 None,
             ))
+    }
+
+    fn scheduling_request(request_id: &str, task_id: &str) -> ScheduleRequest {
+        ScheduleRequest {
+            mode: ScheduleMode::Tracked {
+                request_id: request_id.to_owned(),
+            },
+            deadline: None,
+            token_seq: Some(vec![1, 2, 3, 4]),
+            block_hashes: None,
+            isl_tokens: 8,
+            lora_name: None,
+            expected_output_tokens: None,
+            pinned_worker: None,
+            allowed_worker_ids: None,
+            routing_constraints: RoutingConstraints::default(),
+            router_config_override: None,
+            priority_jump: 0.0,
+            strict_priority: 0,
+            policy_class: None,
+            session_context: Some(SessionContext::new(
+                task_id.to_owned(),
+                None,
+                None,
+                None,
+                None,
+            )),
+            overlap: OverlapSignals::default(),
+            router_hint_candidates: None,
+            retain_router_hint_chain: false,
+            shared_cache_hits: None,
+        }
+    }
+
+    #[derive(Clone, PartialEq)]
+    struct TestWorkerConfig;
+
+    impl WorkerConfigLike for TestWorkerConfig {
+        fn data_parallel_start_rank(&self) -> u32 {
+            0
+        }
+
+        fn data_parallel_size(&self) -> u32 {
+            1
+        }
+
+        fn max_num_batched_tokens(&self) -> Option<u64> {
+            Some(64)
+        }
+
+        fn total_kv_blocks(&self) -> Option<u64> {
+            Some(64)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scheduler_holds_same_task_in_classify_until_completion() {
+        let slots = Arc::new(ActiveSequencesMultiWorker::new(
+            NoopSequencePublisher,
+            64,
+            HashMap::from([(0, (0, 1))]),
+            false,
+            0,
+            "test",
+        ));
+        let (_worker_configs, worker_configs) =
+            watch::channel(HashMap::from([(0, TestWorkerConfig)]));
+        let cancel = CancellationToken::new();
+        let scheduler: LocalScheduler<NoopSequencePublisher, TestWorkerConfig> =
+            LocalScheduler::new_with_policy_profile_and_flow_control(
+                slots,
+                worker_configs,
+                PolicyProfile::synthetic(None, RouterQueuePolicy::Fcfs),
+                64,
+                DefaultWorkerSelector::new(None, "test"),
+                None,
+                None,
+                None,
+                None,
+                Duration::from_secs(60),
+                true,
+                cancel.clone(),
+                "test",
+                false,
+                FlowControlConfig::new(TaskWidthPolicy::new(NonZeroUsize::MIN)),
+            )
+            .await
+            .unwrap();
+        let scheduler = Arc::new(scheduler);
+
+        scheduler
+            .schedule_request(scheduling_request("request-1", "task-1"))
+            .await
+            .unwrap();
+
+        let request_scheduler = Arc::clone(&scheduler);
+        let mut second = tokio::spawn(async move {
+            request_scheduler
+                .schedule_request(scheduling_request("request-2", "task-1"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while scheduler.pending_classification_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(scheduler.pending_count(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut second)
+                .await
+                .is_err()
+        );
+
+        scheduler.free("request-1").await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), &mut second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.best_worker.worker_id, 0);
+        scheduler.free("request-2").await.unwrap();
+
+        cancel.cancel();
+        scheduler.wait_for_flow_control_shutdown().await;
     }
 
     #[tokio::test]

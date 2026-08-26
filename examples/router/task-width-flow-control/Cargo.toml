@@ -14,4 +14,6 @@ description = "Task-width flow-control policy example for Dynamo"
 [dependencies]
 async-trait.workspace = true
 dynamo-kv-router.workspace = true
+parking_lot.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
