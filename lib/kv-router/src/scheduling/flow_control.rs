@@ -303,8 +303,12 @@ impl FlowControlRuntime {
         let init = AssertUnwindSafe(async move { init_policy.init().await }).catch_unwind();
         tokio::pin!(init);
         tokio::select! {
-            result = &mut init => map_policy_future_result("init", result)?,
+            biased;
             _ = shutdown.cancelled() => return Err(KvSchedulerError::SubscriberShutdown),
+            result = &mut init => map_policy_future_result("init", result)?,
+        }
+        if shutdown.is_cancelled() {
+            return Err(KvSchedulerError::SubscriberShutdown);
         }
 
         let max_pending_classifications = config.max_pending_classifications;
@@ -366,22 +370,31 @@ impl FlowControlRuntime {
         })
         .catch_unwind();
         tokio::pin!(classify);
-        if let Some(deadline) = deadline {
+        let result = if let Some(deadline) = deadline {
             tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => Err(KvSchedulerError::SubscriberShutdown),
+                _ = tokio::time::sleep_until(deadline.into()) => Err(KvSchedulerError::DeadlineExceeded),
                 result = &mut classify => {
                     map_policy_future_result("classify", result)
                 }
-                _ = self.shutdown.cancelled() => Err(KvSchedulerError::SubscriberShutdown),
-                _ = tokio::time::sleep_until(deadline.into()) => Err(KvSchedulerError::DeadlineExceeded),
             }
         } else {
             tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => Err(KvSchedulerError::SubscriberShutdown),
                 result = &mut classify => {
                     map_policy_future_result("classify", result)
                 }
-                _ = self.shutdown.cancelled() => Err(KvSchedulerError::SubscriberShutdown),
             }
+        };
+        if self.shutdown.is_cancelled() {
+            return Err(KvSchedulerError::SubscriberShutdown);
         }
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Err(KvSchedulerError::DeadlineExceeded);
+        }
+        result
     }
 
     fn acquire_classification_permit(&self) -> Result<ClassificationPermit, KvSchedulerError> {
@@ -621,6 +634,17 @@ mod tests {
         let result = PassThrough.classify(request).await.unwrap();
 
         assert_eq!(result, Classification::default());
+    }
+
+    #[tokio::test]
+    async fn initialization_refuses_an_already_cancelled_runtime() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let result =
+            FlowControlRuntime::initialize(FlowControlConfig::new(PassThrough), shutdown).await;
+
+        assert!(matches!(result, Err(KvSchedulerError::SubscriberShutdown)));
     }
 
     struct PendingPolicy {
