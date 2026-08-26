@@ -136,6 +136,7 @@ impl Stream for KvDemandStream {
 struct DemandDrivenState<T> {
     stream: Mutex<Pin<Box<dyn Stream<Item = T> + Send>>>,
     cancelled: CancellationToken,
+    drop_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl<T> DemandDrivenState<T> {
@@ -158,6 +159,7 @@ impl<T: 'static> DemandDrivenOwner<T> {
             state: Some(Arc::new(DemandDrivenState {
                 stream: Mutex::new(stream),
                 cancelled: CancellationToken::new(),
+                drop_runtime: tokio::runtime::Handle::try_current().ok(),
             })),
         }
     }
@@ -188,7 +190,17 @@ impl<T: 'static> Drop for DemandDrivenOwner<T> {
         }
 
         // Python can release the stream outside Tokio. Keep the final Arc alive
-        // until the PyO3 runtime drops it so nested router guards can spawn cleanup.
+        // until the runtime that created it drops it so nested router guards can
+        // spawn cleanup.
+        if let Some(runtime) = state.drop_runtime.clone() {
+            drop(runtime.spawn(async move {
+                drop(state);
+            }));
+            return;
+        }
+
+        // Construction outside Tokio is not expected for Python request streams,
+        // but retain the PyO3 runtime fallback for callers without a current handle.
         drop(pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
             drop(state);
         }));
