@@ -533,9 +533,10 @@ impl<
             .is_ok()
     }
 
-    /// Enqueue a new request.
-    /// If queueing is disabled or workers have capacity, schedule immediately.
-    /// Otherwise park in the pending heap.
+    /// Enter a new request into Order.
+    ///
+    /// The actor may enqueue and select the request in one turn when capacity is
+    /// available. Otherwise the request remains in the pending heap.
     pub async fn enqueue(&self, request: SchedulingRequest) {
         self.enqueue_with_block_hashes(request, None).await;
     }
@@ -2574,11 +2575,11 @@ policy_classes:
         let (queue, slots) = make_queue(num_workers, block_size, isl, Some(0.0));
         assert_eq!(queue.pending_count(), 0);
 
-        // First request goes through (worker is idle)
+        // The first request enters and leaves Order in one turn (worker is idle).
         let (req1, rx1) = make_request("req-1", isl);
         queue.enqueue(req1).await;
         let _resp1 = rx1.await.unwrap().unwrap();
-        assert_eq!(queue.pending_count(), 0); // scheduled immediately
+        assert_eq!(queue.pending_count(), 0);
 
         // Second and third requests should be queued (worker is now prefill-busy)
         let (req2, _rx2) = make_request("req-2", isl);
