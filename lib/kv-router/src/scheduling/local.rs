@@ -52,6 +52,9 @@ impl FlowControlRequestGuard {
         request_id: Option<String>,
         tracked: bool,
     ) -> Self {
+        if let Some(request_id) = request_id.as_deref() {
+            flow_control.begin_request(request_id);
+        }
         Self {
             flow_control,
             request_id,
@@ -65,15 +68,16 @@ impl FlowControlRequestGuard {
             self.released = true;
             return;
         };
-        let event = if self.tracked {
-            FlowControlEvent::Dispatched { request_id, worker }
+        if self.tracked {
+            self.flow_control
+                .emit(FlowControlEvent::Dispatched { request_id, worker });
         } else {
-            FlowControlEvent::Completed {
-                request_id,
-                context_tokens: None,
-            }
-        };
-        self.flow_control.emit(event);
+            self.flow_control
+                .finish_request(FlowControlEvent::Completed {
+                    request_id,
+                    context_tokens: None,
+                });
+        }
         self.released = true;
     }
 }
@@ -87,7 +91,7 @@ impl Drop for FlowControlRequestGuard {
             return;
         };
         self.flow_control
-            .emit(FlowControlEvent::Aborted { request_id });
+            .finish_request(FlowControlEvent::Aborted { request_id });
     }
 }
 
@@ -385,7 +389,7 @@ where
                         queue_config_updates.update().await;
                         let _ = queue_updates_config.send(());
                         if let Some(flow_control) = flow_control_config_updates.as_ref() {
-                            flow_control.emit(FlowControlEvent::Reconcile);
+                            flow_control.reconcile();
                         }
                     }
                 }
@@ -658,7 +662,7 @@ where
     pub fn register_workers(&self, worker_ids: &HashSet<WorkerId>) {
         self.queue.register_workers(worker_ids);
         if let Some(flow_control) = self.flow_control.as_ref() {
-            flow_control.emit(FlowControlEvent::Reconcile);
+            flow_control.reconcile();
         }
     }
 
@@ -710,8 +714,8 @@ where
                 None => self.queue.update().await,
             }
             if let Some(flow_control) = self.flow_control.as_ref() {
-                flow_control.emit(FlowControlEvent::Completed {
-                    request_id: request_id.clone(),
+                flow_control.finish_request(FlowControlEvent::Completed {
+                    request_id,
                     context_tokens: None,
                 });
             }
@@ -735,8 +739,8 @@ where
         if outcome.is_applied() {
             self.queue.update_worker(worker).await;
             if let Some(flow_control) = self.flow_control.as_ref() {
-                flow_control.emit(FlowControlEvent::Completed {
-                    request_id: request_id.clone(),
+                flow_control.finish_request(FlowControlEvent::Completed {
+                    request_id,
                     context_tokens: None,
                 });
             }

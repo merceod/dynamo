@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
+use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -167,7 +169,13 @@ pub enum FlowControlEvent {
     WorkerLoadChanged {
         worker: Option<WorkerWithDpRank>,
     },
-    Reconcile,
+    Reconcile {
+        /// Router-owned requests that have not reached a terminal state.
+        ///
+        /// Policies use this snapshot to clean request-local state after the
+        /// bounded event mailbox coalesces one or more lifecycle events.
+        live_request_ids: Arc<[String]>,
+    },
 }
 
 impl FlowControlEvent {
@@ -177,7 +185,7 @@ impl FlowControlEvent {
             Self::Completed { .. } => "completed",
             Self::Aborted { .. } => "aborted",
             Self::WorkerLoadChanged { .. } => "worker_load_changed",
-            Self::Reconcile => "reconcile",
+            Self::Reconcile { .. } => "reconcile",
         }
     }
 }
@@ -266,6 +274,7 @@ pub(crate) struct FlowControlRuntime {
     classifications_idle: Arc<tokio::sync::Notify>,
     max_pending_classifications: usize,
     event_tx: mpsc::Sender<FlowControlEvent>,
+    live_requests: Arc<Mutex<HashSet<String>>>,
     reconcile_pending: Arc<AtomicBool>,
     reconcile_notify: Arc<tokio::sync::Notify>,
     shutdown: CancellationToken,
@@ -305,6 +314,7 @@ impl FlowControlRuntime {
         let classifications_idle = Arc::new(tokio::sync::Notify::new());
         let reconcile_pending = Arc::new(AtomicBool::new(false));
         let reconcile_notify = Arc::new(tokio::sync::Notify::new());
+        let live_requests = Arc::new(Mutex::new(HashSet::new()));
         let (shutdown_complete_tx, shutdown_complete) = watch::channel(false);
         let pending_classifications = Arc::new(Semaphore::new(max_pending_classifications));
         let runtime = Arc::new(Self {
@@ -314,6 +324,7 @@ impl FlowControlRuntime {
             classifications_idle: Arc::clone(&classifications_idle),
             max_pending_classifications,
             event_tx,
+            live_requests: Arc::clone(&live_requests),
             reconcile_pending: Arc::clone(&reconcile_pending),
             reconcile_notify: Arc::clone(&reconcile_notify),
             shutdown: shutdown.clone(),
@@ -324,6 +335,7 @@ impl FlowControlRuntime {
             run_event_pump(
                 config.policy,
                 event_rx,
+                live_requests,
                 reconcile_pending,
                 reconcile_notify,
                 pending_classifications,
@@ -407,6 +419,29 @@ impl FlowControlRuntime {
         }
     }
 
+    pub(crate) fn begin_request(&self, request_id: &str) {
+        self.live_requests.lock().insert(request_id.to_owned());
+    }
+
+    pub(crate) fn finish_request(&self, event: FlowControlEvent) {
+        let request_id = match &event {
+            FlowControlEvent::Completed { request_id, .. }
+            | FlowControlEvent::Aborted { request_id } => request_id,
+            _ => {
+                debug_assert!(false, "finish_request requires a terminal event");
+                return;
+            }
+        };
+        self.live_requests.lock().remove(request_id);
+        self.emit(event);
+    }
+
+    pub(crate) fn reconcile(&self) {
+        if !self.shutdown.is_cancelled() {
+            self.request_reconcile();
+        }
+    }
+
     fn request_reconcile(&self) {
         if !self.reconcile_pending.swap(true, Ordering::AcqRel) {
             self.reconcile_notify.notify_one();
@@ -454,6 +489,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 async fn run_event_pump(
     policy: Arc<dyn FlowControlPolicy>,
     mut event_rx: mpsc::Receiver<FlowControlEvent>,
+    live_requests: Arc<Mutex<HashSet<String>>>,
     reconcile_pending: Arc<AtomicBool>,
     reconcile_notify: Arc<tokio::sync::Notify>,
     pending_classifications: Arc<Semaphore>,
@@ -471,7 +507,11 @@ async fn run_event_pump(
                 if !reconcile_pending.swap(false, Ordering::AcqRel) {
                     continue;
                 }
-                FlowControlEvent::Reconcile
+                let mut live_request_ids = live_requests.lock().iter().cloned().collect::<Vec<_>>();
+                live_request_ids.sort_unstable();
+                FlowControlEvent::Reconcile {
+                    live_request_ids: live_request_ids.into(),
+                }
             }
             event = event_rx.recv() => {
                 let Some(event) = event else {
@@ -664,12 +704,16 @@ mod tests {
         entered: Arc<Notify>,
         release: Arc<Notify>,
         events: mpsc::UnboundedSender<&'static str>,
+        reconciliations: mpsc::UnboundedSender<Arc<[String]>>,
     }
 
     #[async_trait]
     impl FlowControlPolicy for BlockingEventPolicy {
         async fn on_event(&self, event: FlowControlEvent) -> Result<(), FlowControlPolicyError> {
             self.events.send(event.kind()).unwrap();
+            if let FlowControlEvent::Reconcile { live_request_ids } = event {
+                self.reconciliations.send(live_request_ids).unwrap();
+            }
             if self.first.swap(false, Ordering::AcqRel) {
                 self.entered.notify_one();
                 self.release.notified().await;
@@ -683,11 +727,13 @@ mod tests {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (reconciliation_tx, mut reconciliation_rx) = mpsc::unbounded_channel();
         let config = FlowControlConfig::new(BlockingEventPolicy {
             first: AtomicBool::new(true),
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
             events: event_tx,
+            reconciliations: reconciliation_tx,
         })
         .with_event_channel_capacity(NonZeroUsize::new(1).unwrap());
         let shutdown = CancellationToken::new();
@@ -695,7 +741,9 @@ mod tests {
             .await
             .unwrap();
 
-        runtime.emit(FlowControlEvent::Completed {
+        runtime.begin_request("live");
+        runtime.begin_request("mailbox-full");
+        runtime.finish_request(FlowControlEvent::Completed {
             request_id: "first".to_string(),
             context_tokens: None,
         });
@@ -705,7 +753,7 @@ mod tests {
             request_id: "second".to_string(),
             context_tokens: None,
         });
-        runtime.emit(FlowControlEvent::Aborted {
+        runtime.finish_request(FlowControlEvent::Aborted {
             request_id: "mailbox-full".to_string(),
         });
         release.notify_one();
@@ -719,6 +767,10 @@ mod tests {
         })
         .await
         .unwrap();
+        assert_eq!(
+            reconciliation_rx.recv().await.as_deref(),
+            Some(["live".to_string()].as_slice())
+        );
         shutdown.cancel();
         runtime.wait_for_shutdown().await;
     }
@@ -797,7 +849,7 @@ mod tests {
     #[async_trait]
     impl FlowControlPolicy for SlowEventPolicy {
         async fn on_event(&self, event: FlowControlEvent) -> Result<(), FlowControlPolicyError> {
-            if matches!(event, FlowControlEvent::Reconcile) {
+            if matches!(event, FlowControlEvent::Reconcile { .. }) {
                 future::pending().await
             } else {
                 self.completed.send(()).unwrap();
@@ -819,7 +871,7 @@ mod tests {
         )
         .await
         .unwrap();
-        runtime.emit(FlowControlEvent::Reconcile);
+        runtime.reconcile();
         runtime.emit(FlowControlEvent::Completed {
             request_id: "after-timeout".to_string(),
             context_tokens: None,
