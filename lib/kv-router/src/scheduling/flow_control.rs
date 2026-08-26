@@ -443,9 +443,10 @@ impl FlowControlRuntime {
     }
 
     fn request_reconcile(&self) {
-        if !self.reconcile_pending.swap(true, Ordering::AcqRel) {
-            self.reconcile_notify.notify_one();
-        }
+        request_reconcile(
+            self.reconcile_pending.as_ref(),
+            self.reconcile_notify.as_ref(),
+        );
     }
 
     pub(crate) async fn wait_for_shutdown(&self) {
@@ -531,10 +532,11 @@ async fn run_event_pump(
             result = &mut event_delivery => Some(result),
             _ = &mut event_sleep => None,
         };
-        match result {
-            Some(Ok(Ok(()))) => {}
+        let failed = match result {
+            Some(Ok(Ok(()))) => false,
             Some(Ok(Err(error))) => {
                 log_event_failure(&mut event_failure_warned, event_kind, &error.to_string());
+                true
             }
             Some(Err(payload)) => {
                 log_event_failure(
@@ -542,10 +544,15 @@ async fn run_event_pump(
                     event_kind,
                     panic_message(payload.as_ref()),
                 );
+                true
             }
             None => {
                 log_event_failure(&mut event_failure_warned, event_kind, "timeout");
+                true
             }
+        };
+        if failed && event_kind != "reconcile" {
+            request_reconcile(reconcile_pending.as_ref(), reconcile_notify.as_ref());
         }
     }
 
@@ -558,6 +565,12 @@ async fn run_event_pump(
             reason = panic_message(payload.as_ref()),
             "Flow-control policy teardown panicked"
         ),
+    }
+}
+
+fn request_reconcile(reconcile_pending: &AtomicBool, reconcile_notify: &tokio::sync::Notify) {
+    if !reconcile_pending.swap(true, Ordering::AcqRel) {
+        reconcile_notify.notify_one();
     }
 }
 
@@ -880,6 +893,54 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(250), completed_rx.recv())
             .await
             .unwrap();
+        shutdown.cancel();
+        runtime.wait_for_shutdown().await;
+    }
+
+    struct TimedOutTerminalPolicy {
+        reconciliations: mpsc::UnboundedSender<Arc<[String]>>,
+    }
+
+    #[async_trait]
+    impl FlowControlPolicy for TimedOutTerminalPolicy {
+        async fn on_event(&self, event: FlowControlEvent) -> Result<(), FlowControlPolicyError> {
+            match event {
+                FlowControlEvent::Completed { .. } => future::pending().await,
+                FlowControlEvent::Reconcile { live_request_ids } => {
+                    self.reconciliations.send(live_request_ids).unwrap();
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_event_triggers_authoritative_reconciliation() {
+        let (reconciliation_tx, mut reconciliation_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let runtime = FlowControlRuntime::initialize(
+            FlowControlConfig::new(TimedOutTerminalPolicy {
+                reconciliations: reconciliation_tx,
+            })
+            .with_event_timeout(Duration::from_millis(5)),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.begin_request("completed"));
+
+        runtime.finish_request(FlowControlEvent::Completed {
+            request_id: "completed".to_string(),
+            context_tokens: None,
+        });
+
+        let live_request_ids =
+            tokio::time::timeout(Duration::from_millis(250), reconciliation_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(live_request_ids.is_empty());
         shutdown.cancel();
         runtime.wait_for_shutdown().await;
     }
