@@ -973,4 +973,38 @@ mod tests {
         shutdown.cancel();
         runtime.wait_for_shutdown().await;
     }
+
+    struct FailingClassifier;
+
+    #[async_trait]
+    impl FlowControlPolicy for FailingClassifier {
+        async fn classify(
+            &self,
+            _request: ClassifyRequest,
+        ) -> Result<Classification, FlowControlPolicyError> {
+            Err(FlowControlPolicyError::new("classification failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn classifier_error_remains_distinct_from_overload() {
+        let shutdown = CancellationToken::new();
+        let runtime = FlowControlRuntime::initialize(
+            FlowControlConfig::new(FailingClassifier),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+
+        let result = runtime
+            .classify(ClassifyRequest::new(Instant::now(), 1, 0, 1))
+            .await;
+
+        let Err(KvSchedulerError::FlowControlPolicy(error)) = result else {
+            panic!("expected a flow-control policy error");
+        };
+        assert_eq!(error.to_string(), "classification failed");
+        shutdown.cancel();
+        runtime.wait_for_shutdown().await;
+    }
 }
